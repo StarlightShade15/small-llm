@@ -2,13 +2,13 @@
 Fine-tuning script for small-lm.
 Loads a pretrained checkpoint and fine-tunes on new conversation data.
 Lower LR, early stopping on val loss.
+Optimized with torch.compile, fused AdamW, efficient logging.
 """
 import os
 import sys
 import math
 import time
 import yaml
-import shutil
 from pathlib import Path
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, asdict
@@ -30,33 +30,35 @@ from src.data.dataset import create_dataloaders, DataConfig
 
 @dataclass
 class FinetuneConfig:
-    learning_rate: float = 1e-4
-    min_lr: float = 1e-5
+    learning_rate: float = 5e-5
+    min_lr: float = 5e-6
     weight_decay: float = 0.05
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
     max_grad_norm: float = 1.0
     warmup_steps: int = 100
-    max_steps: int = 3000
+    max_steps: int = 5000
     early_stopping_patience: int = 3
     early_stopping_min_delta: float = 1e-4
     eval_interval: int = 100
     save_interval: int = 500
     log_interval: int = 20
     sample_interval: int = 200
-    batch_size: int = 8
-    grad_accum: int = 4
+    batch_size: int = 32
+    grad_accum: int = 2
     mixed_precision: str = "bf16"
-    compile: bool = False
-    gradient_checkpointing: bool = True
+    compile: bool = True
+    compile_mode: str = "reduce-overhead"
+    gradient_checkpointing: bool = False
     seed: int = 42
     output_dir: str = "checkpoints/finetune"
     pretrained_path: str = "checkpoints/pretrain"
     train_data: str = "data/processed/train.jsonl"
     val_data: str = "data/processed/val.jsonl"
     freeze_embeddings: bool = False
-    freeze_layers: int = 0  # Number of bottom layers to freeze
+    freeze_layers: int = 0
+    wandb_project: Optional[str] = None
 
 
 def set_seed(seed: int):
@@ -87,7 +89,6 @@ def get_amp_dtype(mixed_precision: str) -> torch.dtype:
 
 
 def get_lr_scheduler(optimizer: AdamW, config: FinetuneConfig) -> LambdaLR:
-    """Cosine LR schedule with warmup."""
     def lr_lambda(step: int) -> float:
         if step < config.warmup_steps:
             return step / max(1, config.warmup_steps)
@@ -107,7 +108,6 @@ def save_checkpoint(
     best_val_loss: Optional[float] = None,
     patience_counter: int = 0,
 ):
-    """Save fine-tuning checkpoint."""
     os.makedirs(path, exist_ok=True)
     
     checkpoint = {
@@ -124,11 +124,9 @@ def save_checkpoint(
     
     torch.save(checkpoint, os.path.join(path, f"step_{step}.pt"))
     
-    # Also save as latest
     latest_path = os.path.join(os.path.dirname(path), "latest.pt")
     torch.save(checkpoint, latest_path)
     
-    # Save best model separately
     if best_val_loss is not None:
         best_path = os.path.join(path, "best_model.pt")
         torch.save({"model": model.state_dict(), "config": asdict(config), "val_loss": best_val_loss}, best_path)
@@ -144,7 +142,6 @@ def load_checkpoint(
     scaler: Optional[GradScaler] = None,
     device: torch.device = torch.device("cpu"),
 ) -> Tuple[int, Optional[float], int]:
-    """Load fine-tuning checkpoint."""
     checkpoint = torch.load(path, map_location=device)
     
     model.load_state_dict(checkpoint["model"])
@@ -190,7 +187,7 @@ def generate_sample(
     tokenizer: ChatTokenizer,
     prompt: str,
     device: torch.device,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 128,
     temperature: float = 0.7,
     top_k: int = 50,
     top_p: float = 0.9,
@@ -218,7 +215,6 @@ def generate_sample(
 
 
 def freeze_layers(model: SmallLM, config: FinetuneConfig):
-    """Freeze embeddings and/or bottom layers."""
     if config.freeze_embeddings:
         for param in model.tok_emb.parameters():
             param.requires_grad = False
@@ -230,39 +226,39 @@ def freeze_layers(model: SmallLM, config: FinetuneConfig):
                 param.requires_grad = False
         print(f"Frozen: first {config.freeze_layers} transformer layers")
     
-    # Count trainable params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"Trainable parameters: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
 
 
 def finetune(config: FinetuneConfig):
-    """Main fine-tuning loop."""
     set_seed(config.seed)
     device = get_device()
     amp_dtype = get_amp_dtype(config.mixed_precision)
     
     print(f"Device: {device}")
     print(f"Mixed precision: {config.mixed_precision}")
+    print(f"Compile: {config.compile} ({config.compile_mode if config.compile else 'N/A'})")
     
-    # Load tokenizer
+    if config.wandb_project:
+        import wandb
+        wandb.init(
+            project=config.wandb_project,
+            name=config.wandb_run_name or f"small-lm-ft-{int(time.time())}",
+            config=asdict(config),
+        )
+    
     tokenizer = ChatTokenizer()
     
-    # Load pretrained model
     print(f"Loading pretrained model from {config.pretrained_path}...")
     model = SmallLM.from_pretrained(config.pretrained_path, device=str(device))
     
-    # Freeze layers if configured
     freeze_layers(model, config)
     
     if config.compile and hasattr(torch, "compile"):
-        print("Compiling model with torch.compile...")
-        model = torch.compile(model)
+        print(f"Compiling model with torch.compile (mode={config.compile_mode})...")
+        model = torch.compile(model, mode=config.compile_mode)
     
-    if config.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-    
-    # Create data loaders
     train_loader, val_loader = create_dataloaders(
         config.train_data,
         tokenizer,
@@ -271,7 +267,6 @@ def finetune(config: FinetuneConfig):
         val_data_path=config.val_data,
     )
     
-    # Optimizer (only trainable params)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(
         trainable_params,
@@ -279,15 +274,12 @@ def finetune(config: FinetuneConfig):
         betas=(config.beta1, config.beta2),
         eps=config.eps,
         weight_decay=config.weight_decay,
+        fused=True,
     )
     
-    # Scheduler
     scheduler = get_lr_scheduler(optimizer, config)
-    
-    # Grad scaler
     scaler = GradScaler(enabled=(config.mixed_precision == "fp16"))
     
-    # Resume
     start_step = 0
     best_val_loss = float("inf")
     patience_counter = 0
@@ -298,7 +290,6 @@ def finetune(config: FinetuneConfig):
             latest_ckpt, model, optimizer, scheduler, scaler, device
         )
     
-    # Training loop
     model.train()
     step = start_step
     epoch = 0
@@ -306,6 +297,7 @@ def finetune(config: FinetuneConfig):
     print(f"Starting fine-tuning from step {step}")
     print(f"Max steps: {config.max_steps}")
     print(f"Early stopping patience: {config.early_stopping_patience}")
+    print(f"Effective batch size: {config.batch_size * config.grad_accum}")
     
     running_loss = 0.0
     running_tokens = 0
@@ -316,6 +308,8 @@ def finetune(config: FinetuneConfig):
         "what is the capital of germany?",
         "what is the largest planet?",
         "what is the speed of light?",
+        "who wrote hamlet?",
+        "what is the boiling point of water?",
     ]
     
     while step < config.max_steps:
@@ -348,7 +342,6 @@ def finetune(config: FinetuneConfig):
             
             step += 1
             
-            # Logging
             if step % config.log_interval == 0:
                 avg_loss = running_loss / max(1, running_tokens)
                 lr = scheduler.get_last_lr()[0]
@@ -357,14 +350,26 @@ def finetune(config: FinetuneConfig):
                 
                 print(f"Step {step:6d} | Loss: {avg_loss:.4f} | LR: {lr:.2e} | Tokens/s: {tokens_per_sec:.0f}")
                 
+                if config.wandb_project:
+                    import wandb
+                    wandb.log({
+                        "train/loss": avg_loss,
+                        "train/lr": lr,
+                        "train/tokens_per_sec": tokens_per_sec,
+                        "train/step": step,
+                    })
+                
                 running_loss = 0.0
                 running_tokens = 0
                 log_start_time = time.time()
             
-            # Evaluation with early stopping
             if step % config.eval_interval == 0:
                 val_loss = evaluate(model, val_loader, device, amp_dtype)
                 print(f"  Val Loss: {val_loss:.4f} (best: {best_val_loss:.4f}, patience: {patience_counter}/{config.early_stopping_patience})")
+                
+                if config.wandb_project:
+                    import wandb
+                    wandb.log({"val/loss": val_loss, "val/step": step})
                 
                 if val_loss < best_val_loss - config.early_stopping_min_delta:
                     best_val_loss = val_loss
@@ -376,9 +381,11 @@ def finetune(config: FinetuneConfig):
                     if patience_counter >= config.early_stopping_patience:
                         print(f"Early stopping triggered at step {step}")
                         save_checkpoint(model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss, patience_counter)
+                        if config.wandb_project:
+                            import wandb
+                            wandb.finish()
                         return
             
-            # Sample generation
             if step % config.sample_interval == 0:
                 print(f"  Samples at step {step}:")
                 for prompt in sample_prompts:
@@ -386,24 +393,27 @@ def finetune(config: FinetuneConfig):
                     print(f"    Q: {prompt}")
                     print(f"    A: {response}")
             
-            # Regular checkpoint
             if step % config.save_interval == 0:
                 save_checkpoint(model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss, patience_counter)
     
-    # Final save
     save_checkpoint(model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss, patience_counter)
     print("Fine-tuning complete!")
+    
+    if config.wandb_project:
+        import wandb
+        wandb.finish()
 
 
 def load_config(config_path: str = "configs/model_config.yaml") -> FinetuneConfig:
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
     ft_cfg = cfg.get("finetune", {})
-    # Also get training batch_size etc.
     train_cfg = cfg.get("training", {})
-    ft_cfg.setdefault("batch_size", train_cfg.get("batch_size", 8))
-    ft_cfg.setdefault("grad_accum", train_cfg.get("grad_accum", 4))
+    ft_cfg.setdefault("batch_size", train_cfg.get("batch_size", 32))
+    ft_cfg.setdefault("grad_accum", train_cfg.get("grad_accum", 2))
     ft_cfg.setdefault("mixed_precision", train_cfg.get("mixed_precision", "bf16"))
+    ft_cfg.setdefault("compile", train_cfg.get("compile", True))
+    ft_cfg.setdefault("compile_mode", train_cfg.get("compile_mode", "reduce-overhead"))
     return FinetuneConfig(**ft_cfg)
 
 
@@ -418,6 +428,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", default="checkpoints/finetune", help="Output directory")
     parser.add_argument("--max-steps", type=int, help="Override max steps")
     parser.add_argument("--lr", type=float, help="Override learning rate")
+    parser.add_argument("--wandb", help="Wandb project name")
     args = parser.parse_args()
     
     config = load_config(args.config)
@@ -433,5 +444,7 @@ if __name__ == "__main__":
         config.max_steps = args.max_steps
     if args.lr:
         config.learning_rate = args.lr
+    if args.wandb:
+        config.wandb_project = args.wandb
     
     finetune(config)

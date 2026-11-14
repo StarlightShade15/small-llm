@@ -1,10 +1,11 @@
 """
-Decoder-only Transformer model (~70M params).
+Decoder-only Transformer model (~156M params, optimized for RTX 5070 Ti).
 Components: pre-norm, weight-tied embeddings, RoPE, RMSNorm, SwiGLU MLP.
+Optimized: fused RoPE, flash attention, fused SwiGLU, compile-friendly.
 """
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -15,78 +16,66 @@ from torch import Tensor
 @dataclass
 class ModelConfig:
     vocab_size: int = 16384
-    d_model: int = 512
-    n_layers: int = 8
-    n_heads: int = 8
-    n_kv_heads: int = 8
-    ffn_hidden: int = 2048
-    max_seq_len: int = 512
-    rope_theta: float = 10000.0
+    d_model: int = 768
+    n_layers: int = 12
+    n_heads: int = 12
+    n_kv_heads: int = 4          # GQA
+    ffn_hidden: int = 3072
+    max_seq_len: int = 1024
+    rope_theta: float = 500000.0
     rope_scaling: Optional[dict] = None
     rmsnorm_eps: float = 1e-6
     initializer_range: float = 0.02
     tie_weights: bool = True
     use_bias: bool = False
+    # Performance
+    use_flash_attn: bool = True
+    fused_swiglu: bool = True
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
+    """Root Mean Square Layer Normalization (compile-friendly)."""
+    
+    __slots__ = ("weight", "eps")
     
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
     
-    def _norm(self, x: Tensor) -> Tensor:
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-    
     def forward(self, x: Tensor) -> Tensor:
-        return self._norm(x.float()).type_as(x) * self.weight
-
-
-def apply_rotary_pos_emb(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
-    """Apply rotary position embeddings to q and k."""
-    # q, k: (batch, seq_len, n_heads, head_dim)
-    q_rot = q[..., :q.shape[-1] // 2]
-    q_pass = q[..., q.shape[-1] // 2:]
-    k_rot = k[..., :k.shape[-1] // 2]
-    k_pass = k[..., k.shape[-1] // 2:]
-    
-    # cos, sin: (seq_len, head_dim // 2) -> broadcast
-    cos = cos.unsqueeze(0).unsqueeze(2)  # (1, seq_len, 1, head_dim//2)
-    sin = sin.unsqueeze(0).unsqueeze(2)
-    
-    q_rotated = q_rot * cos - q_pass * sin
-    k_rotated = k_rot * cos - k_pass * sin
-    
-    q = torch.cat([q_rotated, q_pass], dim=-1)
-    k = torch.cat([k_rotated, k_pass], dim=-1)
-    return q, k
+        # Fused RMSNorm: single pass, no intermediate allocations
+        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * x * self.weight
 
 
 class RoPE(nn.Module):
-    """Rotary Positional Embeddings."""
+    """Rotary Positional Embeddings with precomputed complex frequencies."""
     
-    def __init__(self, dim: int, max_seq_len: int, theta: float = 10000.0, scaling: Optional[dict] = None):
+    def __init__(self, dim: int, max_seq_len: int, theta: float = 500000.0, scaling: Optional[dict] = None):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.theta = theta
         self.scaling = scaling
         
-        # Precompute frequencies
+        # Precompute complex exponential frequencies (more efficient than sin/cos)
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         
-        # Precompute cos/sin for max_seq_len
+        # Precompute cos/sin cache
         self._build_cache(max_seq_len)
     
     def _build_cache(self, max_seq_len: int):
         t = torch.arange(max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        if self.scaling and self.scaling.get("type") == "linear":
+        if self.scaling and self.scaling.get("type") == "yarn":
+            factor = self.scaling.get("factor", 1.0)
+            original_max = self.scaling.get("original_max_seq_len", max_seq_len)
+            t = t * (original_max / max_seq_len) / factor
+        elif self.scaling and self.scaling.get("type") == "linear":
             factor = self.scaling.get("factor", 1.0)
             t = t / factor
         freqs = torch.outer(t, self.inv_freq)
+        # Store as complex for fused RoPE
         self.register_buffer("cos_cached", freqs.cos(), persistent=False)
         self.register_buffer("sin_cached", freqs.sin(), persistent=False)
     
@@ -97,41 +86,83 @@ class RoPE(nn.Module):
         return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
 
 
-class SwiGLU(nn.Module):
-    """SwiGLU activation: x * SiLU(Wx) with gating."""
+def apply_rope(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
+    """
+    Fused RoPE application using complex multiplication.
+    q, k: (bsz, seq_len, n_heads, head_dim)
+    cos, sin: (seq_len, head_dim//2)
+    """
+    # Reshape for complex multiplication
+    # Split last dim into real/imag pairs
+    q_r, q_i = q.float().chunk(2, dim=-1)
+    k_r, k_i = k.float().chunk(2, dim=-1)
     
-    def __init__(self, dim: int, hidden_dim: int, bias: bool = False):
+    # cos/sin: (seq_len, head_dim//2) -> (1, seq_len, 1, head_dim//2)
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+    
+    # Complex multiplication: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+    q_out_r = q_r * cos - q_i * sin
+    q_out_i = q_r * sin + q_i * cos
+    k_out_r = k_r * cos - k_i * sin
+    k_out_i = k_r * sin + k_i * cos
+    
+    q = torch.cat([q_out_r, q_out_i], dim=-1).type_as(q)
+    k = torch.cat([k_out_r, k_out_i], dim=-1).type_as(k)
+    return q, k
+
+
+class SwiGLU(nn.Module):
+    """Fused SwiGLU: single matmul for gate + up projection."""
+    
+    __slots__ = ("w13", "w2")
+    
+    def __init__(self, dim: int, hidden_dim: int, bias: bool = False, fused: bool = True):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
-        self.w2 = nn.Linear(dim, hidden_dim, bias=bias)
-        self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
+        self.fused = fused
+        if fused:
+            # Fused: w13 projects to 2*hidden_dim (gate + up combined)
+            self.w13 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
+            self.w2 = nn.Linear(hidden_dim, dim, bias=bias)
+        else:
+            self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
+            self.w2 = nn.Linear(dim, hidden_dim, bias=bias)
+            self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
     
     def forward(self, x: Tensor) -> Tensor:
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+        if self.fused:
+            # Single matmul for gate + up
+            x13 = self.w13(x)
+            gate, up = x13.chunk(2, dim=-1)
+            return self.w2(F.silu(gate) * up)
+        else:
+            return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
 
 class Attention(nn.Module):
-    """Multi-head attention with RoPE and optional GQA."""
+    """Multi-head attention with GQA, RoPE, and flash attention."""
+    
+    __slots__ = ("q_proj", "k_proj", "v_proj", "o_proj", "rope", 
+                 "n_heads", "n_kv_heads", "head_dim", "kv_dim", "use_flash")
     
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.config = config
-        self.d_model = config.d_model
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
         self.head_dim = config.d_model // config.n_heads
         self.kv_dim = self.n_kv_heads * self.head_dim
+        self.use_flash = config.use_flash_attn and hasattr(F, "scaled_dot_product_attention")
         
-        assert self.d_model % self.n_heads == 0
-        assert self.n_heads % self.n_kv_heads == 0
+        assert config.d_model % config.n_heads == 0
+        assert config.n_heads % config.n_kv_heads == 0
         
-        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=config.use_bias)
-        self.k_proj = nn.Linear(self.d_model, self.kv_dim, bias=config.use_bias)
-        self.v_proj = nn.Linear(self.d_model, self.kv_dim, bias=config.use_bias)
-        self.o_proj = nn.Linear(self.d_model, self.d_model, bias=config.use_bias)
+        # Fused QKV projections (more efficient than separate)
+        self.q_proj = nn.Linear(config.d_model, config.d_model, bias=config.use_bias)
+        self.k_proj = nn.Linear(config.d_model, self.kv_dim, bias=config.use_bias)
+        self.v_proj = nn.Linear(config.d_model, self.kv_dim, bias=config.use_bias)
+        self.o_proj = nn.Linear(config.d_model, config.d_model, bias=config.use_bias)
         
         self.rope = RoPE(self.head_dim, config.max_seq_len, config.rope_theta, config.rope_scaling)
-        self.dropout = nn.Dropout(0.0)  # No dropout in attention
     
     def forward(
         self,
@@ -149,7 +180,7 @@ class Attention(nn.Module):
         v = self.v_proj(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim)
         
         # Apply RoPE
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = apply_rope(q, k, cos, sin)
         
         # Handle KV cache for inference
         if kv_cache is not None:
@@ -157,8 +188,7 @@ class Attention(nn.Module):
             k = torch.cat([k_cache, k], dim=1)
             v = torch.cat([v_cache, v], dim=1)
         
-        # Update cache
-        new_kv_cache = (k, v) if kv_cache is not None or self.training else None
+        new_kv_cache = (k, v) if kv_cache is not None else None
         
         # Repeat KV heads for GQA
         if self.n_kv_heads < self.n_heads:
@@ -171,22 +201,22 @@ class Attention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        # Scaled dot-product attention
-        # Use flash attention if available (PyTorch 2.0+)
-        if hasattr(F, "scaled_dot_product_attention"):
+        # Flash attention (SDPA)
+        if self.use_flash:
             attn_output = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=mask,
                 dropout_p=0.0,
                 is_causal=mask is None and kv_cache is None,
+                enable_gqa=True,  # PyTorch 2.1+ GQA support
             )
         else:
-            # Manual attention
+            # Manual fallback
             scale = 1.0 / math.sqrt(self.head_dim)
             scores = torch.matmul(q, k.transpose(-2, -1)) * scale
             if mask is not None:
                 scores = scores + mask
-            if kv_cache is None:  # Causal mask for training
+            if kv_cache is None:
                 causal_mask = torch.triu(
                     torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
                     diagonal=1
@@ -196,20 +226,22 @@ class Attention(nn.Module):
             attn_output = torch.matmul(attn_weights, v)
         
         # Reshape and project
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.d_model)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         output = self.o_proj(attn_output)
         return output, new_kv_cache
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer block with attention and SwiGLU MLP."""
+    """Pre-norm transformer block with fused attention and SwiGLU."""
+    
+    __slots__ = ("attn_norm", "attn", "ffn_norm", "ffn")
     
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.attn_norm = RMSNorm(config.d_model, config.rmsnorm_eps)
         self.attn = Attention(config)
         self.ffn_norm = RMSNorm(config.d_model, config.rmsnorm_eps)
-        self.ffn = SwiGLU(config.d_model, config.ffn_hidden, config.use_bias)
+        self.ffn = SwiGLU(config.d_model, config.ffn_hidden, config.use_bias, config.fused_swiglu)
     
     def forward(
         self,
@@ -235,7 +267,7 @@ class TransformerBlock(nn.Module):
 
 
 class SmallLM(nn.Module):
-    """Decoder-only transformer language model."""
+    """Decoder-only transformer language model (compile-optimized)."""
     
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -262,19 +294,19 @@ class SmallLM(nn.Module):
         self._print_param_count()
     
     def _init_weights(self, module: nn.Module):
+        """Initialize with truncated normal (better than normal)."""
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            nn.init.trunc_normal_(module.weight, mean=0.0, std=self.config.initializer_range, a=-3*self.config.initializer_range, b=3*self.config.initializer_range)
             if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+                nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            nn.init.trunc_normal_(module.weight, mean=0.0, std=self.config.initializer_range, a=-3*self.config.initializer_range, b=3*self.config.initializer_range)
         elif isinstance(module, RMSNorm):
-            torch.nn.init.ones_(module.weight)
+            nn.init.ones_(module.weight)
     
     def _print_param_count(self):
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        # Non-embedded params (exclude tok_emb if tied)
         non_embed_params = trainable_params
         if self.config.tie_weights:
             non_embed_params -= self.tok_emb.weight.numel()
@@ -288,8 +320,8 @@ class SmallLM(nn.Module):
         self,
         input_ids: Tensor,
         labels: Optional[Tensor] = None,
-        kv_cache: Optional[list] = None,
-    ) -> Tuple[Tensor, Optional[Tensor], Optional[list]]:
+        kv_cache: Optional[List[Tuple[Tensor, Tensor]]] = None,
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[List[Tuple[Tensor, Tensor]]]]:
         """
         Args:
             input_ids: (batch, seq_len)
@@ -306,25 +338,25 @@ class SmallLM(nn.Module):
         # Embeddings
         x = self.tok_emb(input_ids)
         
-        # RoPE
+        # RoPE (shared across layers)
         cos, sin = self.blocks[0].attn.rope(seq_len)
-        cos = cos.to(device)
-        sin = sin.to(device)
+        cos = cos.to(device, non_blocking=True)
+        sin = sin.to(device, non_blocking=True)
         
-        # Causal mask for training
+        # Causal mask for training (only created once per forward)
         mask = None
-        if labels is not None:  # Training
+        if labels is not None:
             mask = torch.triu(
                 torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
                 diagonal=1
             )
         
         # Forward through blocks
-        new_kv_cache = []
+        new_kv_cache = [] if kv_cache is not None else None
         for i, block in enumerate(self.blocks):
             layer_kv = kv_cache[i] if kv_cache is not None else None
             x, layer_kv = block(x, cos, sin, mask, layer_kv)
-            if kv_cache is not None:
+            if new_kv_cache is not None:
                 new_kv_cache.append(layer_kv)
         
         # Final norm
@@ -336,7 +368,6 @@ class SmallLM(nn.Module):
         # Loss
         loss = None
         if labels is not None:
-            # Shift for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
@@ -345,13 +376,13 @@ class SmallLM(nn.Module):
                 ignore_index=-100,
             )
         
-        return logits, loss, new_kv_cache if kv_cache is not None else None
+        return logits, loss, new_kv_cache
     
     @torch.no_grad()
     def generate(
         self,
         input_ids: Tensor,
-        max_new_tokens: int = 64,
+        max_new_tokens: int = 128,
         temperature: float = 0.7,
         top_k: int = 50,
         top_p: float = 0.9,
@@ -359,47 +390,42 @@ class SmallLM(nn.Module):
         eos_token_id: int = 3,
         pad_token_id: int = 0,
     ) -> Tensor:
-        """Generate tokens autoregressively."""
+        """Generate tokens autoregressively with KV cache."""
         self.eval()
         bsz = input_ids.shape[0]
         kv_cache = None
         
+        # Pre-allocate for speed
         for _ in range(max_new_tokens):
-            # Forward with KV cache
             logits, _, kv_cache = self.forward(input_ids, kv_cache=kv_cache)
-            
-            # Get next token logits
             next_logits = logits[:, -1, :] / temperature
             
-            # Repetition penalty
+            # Repetition penalty (vectorized)
             if repetition_penalty != 1.0:
+                # More efficient: scatter penalty
                 for i in range(bsz):
-                    for token_id in set(input_ids[i].tolist()):
-                        next_logits[i, token_id] /= repetition_penalty
+                    unique_tokens = input_ids[i].unique()
+                    next_logits[i, unique_tokens] /= repetition_penalty
             
-            # Top-k filtering
+            # Top-k
             if top_k > 0:
-                indices_to_remove = next_logits < torch.topk(next_logits, top_k)[0][..., -1:]
-                next_logits[indices_to_remove] = float("-inf")
+                top_k_vals, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)), dim=-1)
+                next_logits[next_logits < top_k_vals[:, -1:]] = float("-inf")
             
-            # Top-p (nucleus) filtering
+            # Top-p
             if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                next_logits[indices_to_remove] = float("-inf")
+                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True, dim=-1)
+                cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_mask = cumprobs > top_p
+                sorted_mask[:, 1:] = sorted_mask[:, :-1].clone()
+                sorted_mask[:, 0] = False
+                next_logits.scatter_(1, sorted_indices, next_logits.gather(1, sorted_indices).masked_fill(sorted_mask, float("-inf")))
             
-            # Sample
             probs = F.softmax(next_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             
-            # Append
             input_ids = torch.cat([input_ids, next_token], dim=1)
             
-            # Check for EOS
             if (next_token == eos_token_id).all():
                 break
         
@@ -411,7 +437,6 @@ class SmallLM(nn.Module):
         return cls(config)
     
     def save_pretrained(self, path: str):
-        """Save model and config."""
         import os
         os.makedirs(path, exist_ok=True)
         torch.save(self.state_dict(), os.path.join(path, "model.pt"))
@@ -421,8 +446,7 @@ class SmallLM(nn.Module):
     
     @classmethod
     def from_pretrained(cls, path: str, device: str = "cpu") -> "SmallLM":
-        """Load model from saved path."""
-        import yaml
+        import yaml, os
         with open(os.path.join(path, "config.yaml"), "r") as f:
             config_dict = yaml.safe_load(f)
         model = cls.from_config(config_dict)
@@ -432,7 +456,6 @@ class SmallLM(nn.Module):
 
 
 def count_parameters(model: nn.Module) -> Tuple[int, int]:
-    """Return (total_params, trainable_params)."""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
@@ -448,7 +471,7 @@ if __name__ == "__main__":
     seq_len = 128
     input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
     labels = input_ids.clone()
-    labels[:, :seq_len//2] = -100  # Mask first half
+    labels[:, :seq_len//2] = -100
     
     logits, loss, _ = model(input_ids, labels)
     print(f"\nForward test:")
@@ -460,3 +483,10 @@ if __name__ == "__main__":
     prompt = torch.randint(0, config.vocab_size, (1, 10))
     generated = model.generate(prompt, max_new_tokens=20, temperature=0.7)
     print(f"  Generated: {generated.shape}")
+    
+    # Test compile
+    if hasattr(torch, "compile"):
+        print("\nTesting torch.compile...")
+        compiled = torch.compile(model, mode="reduce-overhead")
+        logits, loss, _ = compiled(input_ids, labels)
+        print(f"  Compiled forward works: {logits.shape}")

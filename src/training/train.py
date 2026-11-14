@@ -1,7 +1,8 @@
 """
 Training script for small-lm.
-Features: mixed precision (bf16/fp16), AdamW, cosine LR with warmup, 
+Features: mixed precision (bf16/fp16), AdamW, cosine LR with warmup,
 grad clipping, checkpointing, console logging, periodic sample generation, resume support.
+Optimized for RTX 5070 Ti 16GB with torch.compile.
 """
 import os
 import sys
@@ -9,7 +10,6 @@ import math
 import time
 import json
 import yaml
-import shutil
 from pathlib import Path
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, asdict
@@ -19,6 +19,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
 # Add project root to path
@@ -31,8 +32,8 @@ from src.data.dataset import create_dataloaders, DataConfig
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 16
-    grad_accum: int = 4
+    batch_size: int = 32
+    grad_accum: int = 2
     learning_rate: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 0.1
@@ -40,18 +41,22 @@ class TrainConfig:
     beta2: float = 0.95
     eps: float = 1e-8
     max_grad_norm: float = 1.0
-    warmup_steps: int = 500
-    max_steps: int = 10000
+    warmup_steps: int = 1000
+    max_steps: int = 15000
     eval_interval: int = 500
     save_interval: int = 1000
-    log_interval: int = 50
+    log_interval: int = 25
     sample_interval: int = 500
     mixed_precision: str = "bf16"  # "bf16", "fp16", "fp32"
-    compile: bool = False
-    gradient_checkpointing: bool = True
+    compile: bool = True
+    compile_mode: str = "reduce-overhead"  # "default", "reduce-overhead", "max-autotune"
+    gradient_checkpointing: bool = False
     seed: int = 42
     output_dir: str = "checkpoints/pretrain"
     resume_from: Optional[str] = None
+    # Wandb
+    wandb_project: Optional[str] = None
+    wandb_run_name: Optional[str] = None
 
 
 def set_seed(seed: int):
@@ -62,6 +67,7 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    # For reproducibility with torch.compile
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -120,7 +126,7 @@ def save_checkpoint(
     
     torch.save(checkpoint, os.path.join(path, f"step_{step}.pt"))
     
-    # Also save latest symlink
+    # Also save latest
     latest_path = os.path.join(os.path.dirname(path), "latest.pt")
     torch.save(checkpoint, latest_path)
     
@@ -167,7 +173,6 @@ def evaluate(model: SmallLM, val_loader, device: torch.device, amp_dtype: torch.
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
             _, loss, _ = model(input_ids, labels)
         
-        # Count non-masked tokens
         n_tokens = (labels != -100).sum().item()
         total_loss += loss.item() * n_tokens
         total_tokens += n_tokens
@@ -182,7 +187,7 @@ def generate_sample(
     tokenizer: ChatTokenizer,
     prompt: str,
     device: torch.device,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 128,
     temperature: float = 0.7,
     top_k: int = 50,
     top_p: float = 0.9,
@@ -190,11 +195,9 @@ def generate_sample(
     """Generate a sample response for logging."""
     model.eval()
     
-    # Encode prompt
     input_ids = tokenizer.encode_user(prompt)
     input_ids = torch.tensor([input_ids], dtype=torch.long, device=device)
     
-    # Generate
     generated = model.generate(
         input_ids,
         max_new_tokens=max_new_tokens,
@@ -205,7 +208,6 @@ def generate_sample(
         pad_token_id=tokenizer.pad_token_id,
     )
     
-    # Decode only the new tokens
     new_tokens = generated[0, len(input_ids[0]):].tolist()
     response = tokenizer.decode(new_tokens, skip_special=True)
     
@@ -215,7 +217,6 @@ def generate_sample(
 
 def train(config: TrainConfig):
     """Main training loop."""
-    # Setup
     set_seed(config.seed)
     device = get_device()
     amp_dtype = get_amp_dtype(config.mixed_precision)
@@ -223,6 +224,16 @@ def train(config: TrainConfig):
     print(f"Device: {device}")
     print(f"Mixed precision: {config.mixed_precision}")
     print(f"AMP dtype: {amp_dtype}")
+    print(f"Compile: {config.compile} ({config.compile_mode if config.compile else 'N/A'})")
+    
+    # Wandb init
+    if config.wandb_project:
+        import wandb
+        wandb.init(
+            project=config.wandb_project,
+            name=config.wandb_run_name or f"small-lm-{int(time.time())}",
+            config=asdict(config),
+        )
     
     # Load tokenizer
     tokenizer = ChatTokenizer()
@@ -232,11 +243,8 @@ def train(config: TrainConfig):
     model = SmallLM(model_config).to(device)
     
     if config.compile and hasattr(torch, "compile"):
-        print("Compiling model with torch.compile...")
-        model = torch.compile(model)
-    
-    if config.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        print(f"Compiling model with torch.compile (mode={config.compile_mode})...")
+        model = torch.compile(model, mode=config.compile_mode)
     
     # Create data loaders
     train_loader, val_loader = create_dataloaders(
@@ -254,6 +262,7 @@ def train(config: TrainConfig):
         betas=(config.beta1, config.beta2),
         eps=config.eps,
         weight_decay=config.weight_decay,
+        fused=True,  # Fused AdamW (PyTorch 2.0+)
     )
     
     # Scheduler
@@ -283,18 +292,19 @@ def train(config: TrainConfig):
     print(f"Starting training from step {step}")
     print(f"Max steps: {config.max_steps}")
     print(f"Train batches per epoch: {len(train_loader)}")
+    print(f"Effective batch size: {config.batch_size * config.grad_accum}")
     
-    # For logging
     running_loss = 0.0
     running_tokens = 0
     log_start_time = time.time()
     
-    # Sample prompts for periodic generation
     sample_prompts = [
         "what is the capital of france?",
         "what is the capital of germany?",
         "what is the largest planet?",
         "what is the speed of light?",
+        "who wrote hamlet?",
+        "what is the boiling point of water?",
     ]
     
     while step < config.max_steps:
@@ -342,6 +352,15 @@ def train(config: TrainConfig):
                 
                 print(f"Step {step:6d} | Loss: {avg_loss:.4f} | LR: {lr:.2e} | Tokens/s: {tokens_per_sec:.0f}")
                 
+                if config.wandb_project:
+                    import wandb
+                    wandb.log({
+                        "train/loss": avg_loss,
+                        "train/lr": lr,
+                        "train/tokens_per_sec": tokens_per_sec,
+                        "train/step": step,
+                    })
+                
                 running_loss = 0.0
                 running_tokens = 0
                 log_start_time = time.time()
@@ -350,6 +369,10 @@ def train(config: TrainConfig):
             if step % config.eval_interval == 0:
                 val_loss = evaluate(model, val_loader, device, amp_dtype)
                 print(f"  Val Loss: {val_loss:.4f}")
+                
+                if config.wandb_project:
+                    import wandb
+                    wandb.log({"val/loss": val_loss, "val/step": step})
                 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -371,6 +394,10 @@ def train(config: TrainConfig):
     # Final save
     save_checkpoint(model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss)
     print("Training complete!")
+    
+    if config.wandb_project:
+        import wandb
+        wandb.finish()
 
 
 def load_config(config_path: str = "configs/model_config.yaml") -> TrainConfig:
@@ -390,6 +417,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", default="checkpoints/pretrain", help="Output directory")
     parser.add_argument("--max-steps", type=int, help="Override max steps")
     parser.add_argument("--batch-size", type=int, help="Override batch size")
+    parser.add_argument("--wandb", help="Wandb project name")
     args = parser.parse_args()
     
     config = load_config(args.config)
@@ -401,5 +429,7 @@ if __name__ == "__main__":
         config.max_steps = args.max_steps
     if args.batch_size:
         config.batch_size = args.batch_size
+    if args.wandb:
+        config.wandb_project = args.wandb
     
     train(config)

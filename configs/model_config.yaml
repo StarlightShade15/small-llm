@@ -49,10 +49,11 @@ training:
   sample_interval: 500
   mixed_precision: "bf16"
   compile: true
+  compile_mode: "reduce-overhead"
   gradient_checkpointing: false
   seed: 42
 
-# Fine-tuning configuration
+# Fine-tuning configuration (from-scratch model)
 finetune:
   learning_rate: 5e-5
   min_lr: 5e-6
@@ -62,6 +63,20 @@ finetune:
   weight_decay: 0.05
   batch_size: 32
   grad_accum: 2
+
+# Fine-tuning configuration (pretrained HF model)
+finetune_pretrained:
+  model_name: "HuggingFaceTB/SmolLM-135M"
+  learning_rate: 5e-5
+  min_lr: 5e-6
+  max_steps: 5000
+  early_stopping_patience: 3
+  early_stopping_min_delta: 1e-4
+  weight_decay: 0.05
+  batch_size: 32
+  grad_accum: 2
+  compile: true
+  compile_mode: "reduce-overhead"
 
 # Inference configuration
 inference:
