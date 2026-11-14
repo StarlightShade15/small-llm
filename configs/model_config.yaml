@@ -32,8 +32,8 @@ style:
 
 # Training configuration (optimized for RTX 5070 Ti 16GB)
 training:
-  batch_size: 32
-  grad_accum: 2
+  batch_size: 16
+  grad_accum: 4
   learning_rate: 3e-4
   min_lr: 3e-5
   weight_decay: 0.1
@@ -50,7 +50,7 @@ training:
   mixed_precision: "bf16"
   compile: true
   compile_mode: "reduce-overhead"
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   seed: 42
 
 # Fine-tuning configuration (from-scratch model)

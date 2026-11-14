@@ -316,6 +316,14 @@ class SmallLM(nn.Module):
         print(f"  Non-embedding: {non_embed_params:,}")
         print(f"  ~{total_params / 1e6:.1f}M parameters")
     
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for transformer blocks."""
+        self._gradient_checkpointing = True
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing."""
+        self._gradient_checkpointing = False
+    
     def forward(
         self,
         input_ids: Tensor,
@@ -355,7 +363,22 @@ class SmallLM(nn.Module):
         new_kv_cache = [] if kv_cache is not None else None
         for i, block in enumerate(self.blocks):
             layer_kv = kv_cache[i] if kv_cache is not None else None
-            x, layer_kv = block(x, cos, sin, mask, layer_kv)
+            
+            if getattr(self, '_gradient_checkpointing', False) and self.training and labels is not None:
+                # Use gradient checkpointing for memory efficiency
+                def create_custom_forward(module):
+                    def custom_forward(x, cos, sin, mask, kv_cache):
+                        return module(x, cos, sin, mask, kv_cache)
+                    return custom_forward
+                
+                x, layer_kv = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    x, cos, sin, mask, layer_kv,
+                    use_reentrant=False,
+                )
+            else:
+                x, layer_kv = block(x, cos, sin, mask, layer_kv)
+            
             if new_kv_cache is not None:
                 new_kv_cache.append(layer_kv)
         
