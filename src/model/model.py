@@ -79,11 +79,13 @@ class RoPE(nn.Module):
         self.register_buffer("cos_cached", freqs.cos(), persistent=False)
         self.register_buffer("sin_cached", freqs.sin(), persistent=False)
     
-    def forward(self, seq_len: int) -> Tuple[Tensor, Tensor]:
-        if seq_len > self.max_seq_len:
-            self._build_cache(seq_len)
-            self.max_seq_len = seq_len
-        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+    def forward(self, seq_len: int, start_pos: int = 0) -> Tuple[Tensor, Tensor]:
+        end_pos = start_pos + seq_len
+        if end_pos > self.max_seq_len:
+            new_max = max(end_pos, self.max_seq_len * 2)
+            self._build_cache(new_max)
+            self.max_seq_len = new_max
+        return self.cos_cached[start_pos:end_pos], self.sin_cached[start_pos:end_pos]
 
 
 def apply_rope(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
@@ -190,12 +192,6 @@ class Attention(nn.Module):
         
         new_kv_cache = (k, v) if kv_cache is not None else None
         
-        # Repeat KV heads for GQA
-        if self.n_kv_heads < self.n_heads:
-            repeat_factor = self.n_heads // self.n_kv_heads
-            k = k.repeat_interleave(repeat_factor, dim=2)
-            v = v.repeat_interleave(repeat_factor, dim=2)
-        
         # Transpose for attention: (bsz, n_heads, seq_len, head_dim)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -203,14 +199,32 @@ class Attention(nn.Module):
         
         # Flash attention (SDPA)
         if self.use_flash:
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=mask,
-                dropout_p=0.0,
-                is_causal=mask is None and kv_cache is None,
-                enable_gqa=True,  # PyTorch 2.1+ GQA support
-            )
+            try:
+                # Native GQA avoids materializing repeated KV heads on newer PyTorch.
+                attn_output = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=mask,
+                    dropout_p=0.0,
+                    is_causal=mask is None and kv_cache is None,
+                    enable_gqa=self.n_kv_heads < self.n_heads,
+                )
+            except TypeError:
+                # Compatibility with PyTorch versions before enable_gqa was added.
+                if self.n_kv_heads < self.n_heads:
+                    repeat_factor = self.n_heads // self.n_kv_heads
+                    k = k.repeat_interleave(repeat_factor, dim=1)
+                    v = v.repeat_interleave(repeat_factor, dim=1)
+                attn_output = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=mask,
+                    dropout_p=0.0,
+                    is_causal=mask is None and kv_cache is None,
+                )
         else:
+            if self.n_kv_heads < self.n_heads:
+                repeat_factor = self.n_heads // self.n_kv_heads
+                k = k.repeat_interleave(repeat_factor, dim=1)
+                v = v.repeat_interleave(repeat_factor, dim=1)
             # Manual fallback
             scale = 1.0 / math.sqrt(self.head_dim)
             scores = torch.matmul(q, k.transpose(-2, -1)) * scale
@@ -329,6 +343,7 @@ class SmallLM(nn.Module):
         input_ids: Tensor,
         labels: Optional[Tensor] = None,
         kv_cache: Optional[List[Tuple[Tensor, Tensor]]] = None,
+        return_logits: bool = True,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[List[Tuple[Tensor, Tensor]]]]:
         """
         Args:
@@ -336,7 +351,8 @@ class SmallLM(nn.Module):
             labels: (batch, seq_len) with -100 for masked positions
             kv_cache: List of (k, v) per layer for inference
         Returns:
-            logits: (batch, seq_len, vocab_size)
+            logits: (batch, seq_len, vocab_size), or None when labels are supplied
+                and return_logits=False
             loss: scalar if labels provided
             new_kv_cache: list of (k, v) per layer
         """
@@ -347,17 +363,16 @@ class SmallLM(nn.Module):
         x = self.tok_emb(input_ids)
         
         # RoPE (shared across layers)
-        cos, sin = self.blocks[0].attn.rope(seq_len)
+        past_len = kv_cache[0][0].shape[1] if kv_cache is not None else 0
+        cos, sin = self.blocks[0].attn.rope(seq_len, start_pos=past_len)
         cos = cos.to(device, non_blocking=True)
         sin = sin.to(device, non_blocking=True)
         
-        # Causal mask for training (only created once per forward)
+        # With right-padded batches, padded query positions have masked labels and
+        # valid tokens never attend to padding. Let SDPA use its native causal path.
+        # A boolean upper-triangle SDPA mask means "allowed positions" and would
+        # accidentally expose future tokens, making training loss meaningless.
         mask = None
-        if labels is not None:
-            mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
-                diagonal=1
-            )
         
         # Forward through blocks
         new_kv_cache = [] if kv_cache is not None else None
@@ -385,19 +400,28 @@ class SmallLM(nn.Module):
         # Final norm
         x = self.norm(x)
         
-        # Logits
-        logits = self.head(x)
-        
-        # Loss
+        # When training only on the agent span, project only hidden states that
+        # predict an unmasked target. This avoids allocating [B, T, vocab] logits.
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            shift_labels = labels[..., 1:]
+            valid_targets = shift_labels.ne(-100)
+            if return_logits:
+                logits = self.head(x)
+                shift_logits = logits[..., :-1, :].contiguous()
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.contiguous().view(-1),
+                    ignore_index=-100,
+                )
+            else:
+                target_states = x[..., :-1, :][valid_targets]
+                target_labels = shift_labels[valid_targets]
+                target_logits = self.head(target_states)
+                loss = F.cross_entropy(target_logits, target_labels)
+                logits = None
+        else:
+            logits = self.head(x)
         
         return logits, loss, new_kv_cache
     
@@ -419,8 +443,9 @@ class SmallLM(nn.Module):
         kv_cache = None
         
         # Pre-allocate for speed
+        current_input = input_ids
         for _ in range(max_new_tokens):
-            logits, _, kv_cache = self.forward(input_ids, kv_cache=kv_cache)
+            logits, _, kv_cache = self.forward(current_input, kv_cache=kv_cache)
             next_logits = logits[:, -1, :] / temperature
             
             # Repetition penalty (vectorized)
@@ -448,6 +473,7 @@ class SmallLM(nn.Module):
             next_token = torch.multinomial(probs, num_samples=1)
             
             input_ids = torch.cat([input_ids, next_token], dim=1)
+            current_input = next_token
             
             if (next_token == eos_token_id).all():
                 break
@@ -470,12 +496,25 @@ class SmallLM(nn.Module):
     @classmethod
     def from_pretrained(cls, path: str, device: str = "cpu") -> "SmallLM":
         import yaml, os
-        with open(os.path.join(path, "config.yaml"), "r") as f:
-            config_dict = yaml.safe_load(f)
+        if os.path.isfile(path):
+            checkpoint = torch.load(path, map_location="cpu")
+            config_dict = checkpoint.get("model_config", checkpoint.get("config"))
+            if not isinstance(config_dict, dict) or "d_model" not in config_dict:
+                raise ValueError(f"Checkpoint at {path} does not include a model configuration")
+            state_dict = checkpoint.get("model", checkpoint)
+        else:
+            with open(os.path.join(path, "config.yaml"), "r") as f:
+                config_dict = yaml.safe_load(f)
+            best_path = os.path.join(path, "best_model.pt")
+            if os.path.exists(best_path):
+                checkpoint = torch.load(best_path, map_location="cpu")
+                state_dict = checkpoint["model"]
+                config_dict = checkpoint.get("model_config", config_dict)
+            else:
+                state_dict = torch.load(os.path.join(path, "model.pt"), map_location="cpu")
         model = cls.from_config(config_dict)
-        state_dict = torch.load(os.path.join(path, "model.pt"), map_location=device)
         model.load_state_dict(state_dict)
-        return model
+        return model.to(device)
 
 
 def count_parameters(model: nn.Module) -> Tuple[int, int]:

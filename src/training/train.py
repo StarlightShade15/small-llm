@@ -12,7 +12,8 @@ import json
 import yaml
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -32,12 +33,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.model.model import SmallLM, ModelConfig
 from src.tokenizer.tokenizer import ChatTokenizer
 from src.data.dataset import create_dataloaders, DataConfig
+from src.training.distributed import (
+    cleanup_distributed, init_distributed, is_main_process,
+    reduce_loss_totals, unwrap_model,
+)
 
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 32
-    grad_accum: int = 2
+    batch_size: int = 4
+    grad_accum: int = 8
     learning_rate: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 0.1
@@ -52,10 +57,14 @@ class TrainConfig:
     log_interval: int = 25
     sample_interval: int = 500
     mixed_precision: str = "bf16"  # "bf16", "fp16", "fp32"
-    compile: bool = True
+    compile: bool = False
     compile_mode: str = "reduce-overhead"  # "default", "reduce-overhead", "max-autotune"
-    gradient_checkpointing: bool = False
+    gradient_checkpointing: bool = True
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 1e-4
     seed: int = 42
+    model_config: Dict[str, Any] = field(default_factory=dict)
+    data_config: Dict[str, Any] = field(default_factory=dict)
     output_dir: str = "checkpoints/pretrain"
     resume_from: Optional[str] = None
     # Wandb
@@ -113,10 +122,12 @@ def save_checkpoint(
     config: TrainConfig,
     path: str,
     best_val_loss: Optional[float] = None,
+    is_best: bool = False,
 ):
     """Save training checkpoint."""
     os.makedirs(path, exist_ok=True)
     
+    model = unwrap_model(model)
     checkpoint = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -131,8 +142,15 @@ def save_checkpoint(
     torch.save(checkpoint, os.path.join(path, f"step_{step}.pt"))
     
     # Also save latest
-    latest_path = os.path.join(os.path.dirname(path), "latest.pt")
+    latest_path = os.path.join(path, "latest.pt")
     torch.save(checkpoint, latest_path)
+    model.save_pretrained(path)
+    if is_best:
+        torch.save({
+            "model": model.state_dict(),
+            "model_config": model.config.__dict__,
+            "val_loss": best_val_loss,
+        }, os.path.join(path, "best_model.pt"))
     
     print(f"Checkpoint saved: step {step}")
 
@@ -175,13 +193,14 @@ def evaluate(model: SmallLM, val_loader, device: torch.device, amp_dtype: torch.
         labels = batch["labels"].to(device, non_blocking=True)
         
         with get_amp_context(device.type, amp_dtype, amp_dtype != torch.float32):
-            _, loss, _ = model(input_ids, labels)
+            _, loss, _ = model(input_ids, labels, return_logits=False)
         
-        n_tokens = (labels != -100).sum().item()
+        n_tokens = (labels[:, 1:] != -100).sum().item()
         total_loss += loss.item() * n_tokens
         total_tokens += n_tokens
     
     model.train()
+    total_loss, total_tokens = reduce_loss_totals(total_loss, total_tokens, device)
     return total_loss / max(1, total_tokens)
 
 
@@ -235,17 +254,18 @@ def get_amp_context(device_type: str, dtype: torch.dtype, enabled: bool):
 
 def train(config: TrainConfig):
     """Main training loop."""
+    rank, world_size, local_rank, device = init_distributed()
+    main_process = is_main_process()
     set_seed(config.seed)
-    device = get_device()
     amp_dtype = get_amp_dtype(config.mixed_precision)
     
-    print(f"Device: {device}")
-    print(f"Mixed precision: {config.mixed_precision}")
-    print(f"AMP dtype: {amp_dtype}")
-    print(f"Compile: {config.compile} ({config.compile_mode if config.compile else 'N/A'})")
+    if main_process:
+        print(f"Device: {device} | distributed processes: {world_size}")
+        print(f"Mixed precision: {config.mixed_precision} ({amp_dtype})")
+        print(f"Compile: {config.compile} ({config.compile_mode if config.compile else 'N/A'})")
     
     # Wandb init
-    if config.wandb_project:
+    if config.wandb_project and main_process:
         import wandb
         wandb.init(
             project=config.wandb_project,
@@ -257,20 +277,46 @@ def train(config: TrainConfig):
     tokenizer = ChatTokenizer()
     
     # Create model
-    model_config = ModelConfig()
-    model = SmallLM(model_config).to(device)
+    model_settings = dict(config.model_config)
+    # Match embedding/output size to the tokenizer's actual vocabulary instead
+    # of reserving unused rows when the training corpus is small.
+    model_settings["vocab_size"] = tokenizer.vocab_size
+    model_config = ModelConfig(**model_settings) if model_settings else ModelConfig(vocab_size=tokenizer.vocab_size)
+    core_model = SmallLM(model_config).to(device)
+    if config.gradient_checkpointing:
+        core_model.gradient_checkpointing_enable()
     
     if config.compile and hasattr(torch, "compile"):
-        print(f"Compiling model with torch.compile (mode={config.compile_mode})...")
-        model = torch.compile(model, mode=config.compile_mode)
+        if main_process:
+            print(f"Compiling model with torch.compile (mode={config.compile_mode})...")
+        core_model = torch.compile(core_model, mode=config.compile_mode)
+    if world_size > 1:
+        from torch.nn.parallel import DistributedDataParallel
+        model = DistributedDataParallel(
+            core_model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+        )
+    else:
+        model = core_model
+    raw_model = unwrap_model(model)
     
+    data_settings = dict(config.data_config)
+    data_settings.pop("max_seq_len", None)
+    data_settings.pop("seed", None)
+    data_config = DataConfig(
+        max_seq_len=model_config.max_seq_len,
+        seed=config.seed,
+        **data_settings,
+    )
     # Create data loaders
     train_loader, val_loader = create_dataloaders(
         "data/processed/train.jsonl",
         tokenizer,
-        DataConfig(max_seq_len=model_config.max_seq_len, seed=config.seed),
+        data_config,
         config.batch_size,
         val_data_path="data/processed/val.jsonl" if os.path.exists("data/processed/val.jsonl") else None,
+        distributed=world_size > 1,
     )
     
     # Optimizer
@@ -280,7 +326,7 @@ def train(config: TrainConfig):
         betas=(config.beta1, config.beta2),
         eps=config.eps,
         weight_decay=config.weight_decay,
-        fused=True,  # Fused AdamW (PyTorch 2.0+)
+        fused=device.type == "cuda",
     )
     
     # Scheduler
@@ -295,26 +341,31 @@ def train(config: TrainConfig):
     
     if config.resume_from:
         start_step, best_val_loss = load_checkpoint(
-            config.resume_from, model, optimizer, scheduler, scaler, device
+            config.resume_from, raw_model, optimizer, scheduler, scaler, device
         )
     elif os.path.exists(os.path.join(config.output_dir, "latest.pt")):
         start_step, best_val_loss = load_checkpoint(
-            os.path.join(config.output_dir, "latest.pt"), model, optimizer, scheduler, scaler, device
+            os.path.join(config.output_dir, "latest.pt"), raw_model, optimizer, scheduler, scaler, device
         )
+    best_val_loss = float("inf") if best_val_loss is None else best_val_loss
     
     # Training loop
     model.train()
     step = start_step
     epoch = 0
+    micro_step = step * config.grad_accum
     
-    print(f"Starting training from step {step}")
-    print(f"Max steps: {config.max_steps}")
-    print(f"Train batches per epoch: {len(train_loader)}")
-    print(f"Effective batch size: {config.batch_size * config.grad_accum}")
+    if main_process:
+        print(f"Starting training from optimizer step {step}")
+        print(f"Max steps: {config.max_steps}")
+        print(f"Train batches per epoch: {len(train_loader)}")
+        print(f"Effective global batch size: {config.batch_size * config.grad_accum * world_size}")
     
     running_loss = 0.0
     running_tokens = 0
     log_start_time = time.time()
+    stale_evaluations = 0
+    optimizer.zero_grad(set_to_none=True)
     
     sample_prompts = [
         "what is the capital of france?",
@@ -327,6 +378,8 @@ def train(config: TrainConfig):
     
     while step < config.max_steps:
         epoch += 1
+        if hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch - 1)
         
         for batch in train_loader:
             if step >= config.max_steps:
@@ -334,17 +387,20 @@ def train(config: TrainConfig):
             
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            
-            # Forward with mixed precision
-            with get_amp_context(device.type, amp_dtype, amp_dtype != torch.float32):
-                _, loss, _ = model(input_ids, labels)
-                loss = loss / config.grad_accum
-            
-            # Backward
-            scaler.scale(loss).backward()
-            
-            # Gradient accumulation
-            if (step + 1) % config.grad_accum == 0:
+            update_step = (micro_step + 1) % config.grad_accum == 0
+            sync_context = model.no_sync() if world_size > 1 and not update_step else nullcontext()
+            with sync_context:
+                with get_amp_context(device.type, amp_dtype, amp_dtype != torch.float32):
+                    _, loss, _ = model(input_ids, labels, return_logits=False)
+                    loss = loss / config.grad_accum
+                scaler.scale(loss).backward()
+            micro_step += 1
+
+            n_tokens = (labels[:, 1:] != -100).sum().item()
+            running_loss += loss.item() * config.grad_accum * n_tokens
+            running_tokens += n_tokens
+
+            if update_step:
                 # Unscale for gradient clipping
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
@@ -353,24 +409,21 @@ def train(config: TrainConfig):
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
-            
-            # Track loss
-            n_tokens = (labels != -100).sum().item()
-            running_loss += loss.item() * config.grad_accum * n_tokens
-            running_tokens += n_tokens
-            
-            step += 1
+                step += 1
+            else:
+                continue
             
             # Logging
             if step % config.log_interval == 0:
-                avg_loss = running_loss / max(1, running_tokens)
+                logged_loss, logged_tokens = reduce_loss_totals(running_loss, running_tokens, device)
+                avg_loss = logged_loss / max(1, logged_tokens)
                 lr = scheduler.get_last_lr()[0]
                 elapsed = time.time() - log_start_time
-                tokens_per_sec = running_tokens / elapsed
+                tokens_per_sec = logged_tokens / elapsed
+                if main_process:
+                    print(f"Step {step:6d} | Loss: {avg_loss:.4f} | LR: {lr:.2e} | Tokens/s: {tokens_per_sec:.0f}")
                 
-                print(f"Step {step:6d} | Loss: {avg_loss:.4f} | LR: {lr:.2e} | Tokens/s: {tokens_per_sec:.0f}")
-                
-                if config.wandb_project:
+                if config.wandb_project and main_process:
                     import wandb
                     wandb.log({
                         "train/loss": avg_loss,
@@ -386,36 +439,49 @@ def train(config: TrainConfig):
             # Evaluation
             if step % config.eval_interval == 0:
                 val_loss = evaluate(model, val_loader, device, amp_dtype)
-                print(f"  Val Loss: {val_loss:.4f}")
+                if main_process:
+                    print(f"  Val Loss: {val_loss:.4f}")
                 
-                if config.wandb_project:
+                if config.wandb_project and main_process:
                     import wandb
                     wandb.log({"val/loss": val_loss, "val/step": step})
                 
-                if val_loss < best_val_loss:
+                if val_loss < best_val_loss - config.early_stopping_min_delta:
                     best_val_loss = val_loss
-                    save_checkpoint(model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss)
-                    print(f"  New best val loss: {best_val_loss:.4f}")
+                    stale_evaluations = 0
+                    if main_process:
+                        save_checkpoint(raw_model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss, is_best=True)
+                        print(f"  New best val loss: {best_val_loss:.4f}")
+                else:
+                    stale_evaluations += 1
+                    if config.early_stopping_patience > 0 and stale_evaluations >= config.early_stopping_patience:
+                        if main_process:
+                            print(f"Early stopping at step {step}: validation did not improve for {stale_evaluations} evaluations")
+                        break
             
             # Sample generation
-            if step % config.sample_interval == 0:
+            if step % config.sample_interval == 0 and main_process:
                 print(f"  Samples at step {step}:")
                 for prompt in sample_prompts:
-                    response = generate_sample(model, tokenizer, prompt, device)
+                    response = generate_sample(raw_model, tokenizer, prompt, device)
                     print(f"    Q: {prompt}")
                     print(f"    A: {response}")
             
             # Checkpoint
-            if step % config.save_interval == 0:
-                save_checkpoint(model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss)
+            if step % config.save_interval == 0 and main_process:
+                save_checkpoint(raw_model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss)
+        if config.early_stopping_patience > 0 and stale_evaluations >= config.early_stopping_patience:
+            break
     
     # Final save
-    save_checkpoint(model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss)
-    print("Training complete!")
+    if main_process:
+        save_checkpoint(raw_model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss)
+        print("Training complete!")
     
-    if config.wandb_project:
+    if config.wandb_project and main_process:
         import wandb
         wandb.finish()
+    cleanup_distributed()
 
 
 def load_config(config_path: str = "configs/model_config.yaml") -> TrainConfig:
@@ -423,11 +489,13 @@ def load_config(config_path: str = "configs/model_config.yaml") -> TrainConfig:
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
     train_cfg = cfg.get("training", {})
+    train_cfg["model_config"] = cfg.get("model", {})
+    train_cfg["data_config"] = cfg.get("data", {})
     # Ensure numeric values are proper types (YAML may parse scientific notation as strings)
-    for key in ("learning_rate", "min_lr", "weight_decay", "beta1", "beta2", "eps", "max_grad_norm"):
+    for key in ("learning_rate", "min_lr", "weight_decay", "beta1", "beta2", "eps", "max_grad_norm", "early_stopping_min_delta"):
         if key in train_cfg:
             train_cfg[key] = float(train_cfg[key])
-    for key in ("batch_size", "grad_accum", "warmup_steps", "max_steps", "eval_interval", "save_interval", "log_interval", "sample_interval", "seed"):
+    for key in ("batch_size", "grad_accum", "warmup_steps", "max_steps", "eval_interval", "save_interval", "log_interval", "sample_interval", "seed", "early_stopping_patience"):
         if key in train_cfg:
             train_cfg[key] = int(train_cfg[key])
     return TrainConfig(**train_cfg)

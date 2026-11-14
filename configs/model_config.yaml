@@ -1,4 +1,4 @@
-# Model architecture configuration (~156M parameters, optimized for RTX 5070 Ti 16GB)
+# Model architecture configuration (~116M parameters)
 model:
   vocab_size: 16384
   d_model: 768
@@ -13,6 +13,10 @@ model:
   initializer_range: 0.02
   tie_weights: true
   use_bias: false
+
+# A BPE merge is learned when an adjacent byte/token pair occurs this many times.
+tokenizer:
+  min_frequency: 2
 
 # Special tokens (must match tokenizer)
 special_tokens:
@@ -30,10 +34,10 @@ style:
   forbid_exclamation_marks: false
   max_response_length: 128
 
-# Training configuration (optimized for RTX 3080 20GB)
+# Memory-conscious defaults; batch size is per GPU
 training:
-  batch_size: 16
-  grad_accum: 4
+  batch_size: 4
+  grad_accum: 8
   learning_rate: 3e-4
   min_lr: 3e-5
   weight_decay: 0.1
@@ -48,9 +52,11 @@ training:
   log_interval: 25
   sample_interval: 500
   mixed_precision: "bf16"
-  compile: true
+  compile: false
   compile_mode: "reduce-overhead"
   gradient_checkpointing: true
+  early_stopping_patience: 5
+  early_stopping_min_delta: 1e-4
   seed: 42
 
 # Fine-tuning configuration (from-scratch model)
@@ -61,8 +67,11 @@ finetune:
   early_stopping_patience: 3
   early_stopping_min_delta: 1e-4
   weight_decay: 0.05
-  batch_size: 32
-  grad_accum: 2
+  batch_size: 4
+  grad_accum: 8
+  mixed_precision: "bf16"
+  compile: false
+  gradient_checkpointing: true
 
 # Fine-tuning configuration (pretrained HF model)
 finetune_pretrained:
@@ -73,9 +82,12 @@ finetune_pretrained:
   early_stopping_patience: 3
   early_stopping_min_delta: 1e-4
   weight_decay: 0.05
-  batch_size: 32
-  grad_accum: 2
-  compile: true
+  batch_size: 4
+  grad_accum: 8
+  max_seq_len: 512
+  use_flash_attention: false
+  gradient_checkpointing: true
+  compile: false
   compile_mode: "reduce-overhead"
 
 # Inference configuration
@@ -89,6 +101,6 @@ inference:
 # Data configuration
 data:
   train_split: 0.95
-  num_workers: 8
-  prefetch_factor: 4
+  num_workers: 2
+  prefetch_factor: 2
   pin_memory: true

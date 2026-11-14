@@ -186,14 +186,15 @@ def generate_synthetic_facts(num_facts: int = 1000) -> List[Fact]:
         "william shakespeare", "leo tolstoy", "ernest hemingway", "jane austen", "charles dickens",
     ]
     
-    facts = []
-    for _ in range(num_facts):
-        subject = random.choice(subjects)
-        prop = random.choice(properties)
-        value = random.choice(values)
-        facts.append(Fact(subject, prop, value))
-    
-    return facts
+    combinations = [
+        Fact(subject, prop, value)
+        for subject in subjects
+        for prop in properties
+        for value in values
+    ]
+    if num_facts > len(combinations):
+        print(f"Requested {num_facts} facts, but only {len(combinations)} unique synthetic combinations exist")
+    return random.sample(combinations, min(num_facts, len(combinations)))
 
 
 def generate_qa_dataset(
@@ -209,9 +210,28 @@ def generate_qa_dataset(
             qa = fact.to_qa(style_config)
             qa_pairs.append(qa)
     
-    # Shuffle
-    random.shuffle(qa_pairs)
-    return qa_pairs
+    # Repeated augmentation can choose the same wording more than once.
+    unique_pairs = list({(qa["user"], qa["agent"]): qa for qa in qa_pairs}.values())
+    random.shuffle(unique_pairs)
+    return unique_pairs
+
+
+def split_facts(
+    facts: List[Fact],
+    train_ratio: float = 0.95,
+    seed: int = 42,
+) -> Tuple[List[Fact], List[Fact]]:
+    """Split underlying facts before question augmentation to prevent leakage."""
+    unique = {}
+    for fact in facts:
+        key = (fact.subject.casefold(), fact.property.casefold(), fact.value.casefold())
+        unique[key] = fact
+    unique_facts = list(unique.values())
+    random.Random(seed).shuffle(unique_facts)
+    if len(unique_facts) < 2:
+        return unique_facts, []
+    split_idx = max(1, min(len(unique_facts) - 1, int(len(unique_facts) * train_ratio)))
+    return unique_facts[:split_idx], unique_facts[split_idx:]
 
 
 def save_qa_dataset(qa_pairs: List[Dict[str, str]], output_path: str):
@@ -228,11 +248,20 @@ def create_train_val_split(
     train_ratio: float = 0.95,
     seed: int = 42,
 ) -> Tuple[List[Dict], List[Dict]]:
-    """Split into train/val."""
-    random.seed(seed)
-    random.shuffle(qa_pairs)
-    split_idx = int(len(qa_pairs) * train_ratio)
-    return qa_pairs[:split_idx], qa_pairs[split_idx:]
+    """Split QA examples by answer so paraphrases of a fact stay together."""
+    groups = {}
+    for index, pair in enumerate(qa_pairs):
+        # Generated variations for the same fact share a templated answer.
+        key = str(pair.get("agent", "")).casefold() or f"__row_{index}"
+        groups.setdefault(key, []).append(pair)
+    group_values = list(groups.values())
+    random.Random(seed).shuffle(group_values)
+    if len(group_values) < 2:
+        return qa_pairs, []
+    split_idx = max(1, min(len(group_values) - 1, int(len(group_values) * train_ratio)))
+    train_pairs = [pair for group in group_values[:split_idx] for pair in group]
+    val_pairs = [pair for group in group_values[split_idx:] for pair in group]
+    return train_pairs, val_pairs
 
 
 def main():
@@ -251,6 +280,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
     args = parser.parse_args()
+
+    random.seed(args.seed)
     
     # Load style config
     config = load_config(args.config)
@@ -273,15 +304,17 @@ def main():
         facts = generate_synthetic_facts(args.num_facts)
         print(f"Generated {len(facts)} synthetic facts")
     
-    # Generate Q&A pairs
-    qa_pairs = generate_qa_dataset(facts, style_config, args.augmentations)
-    print(f"Generated {len(qa_pairs)} Q&A pairs")
-    
-    # Save full dataset
+    # Split facts first: question variations from one fact must not appear in
+    # both train and validation, or the validation loss gives a false signal.
+    train_facts, val_facts = split_facts(facts, args.train_ratio, args.seed)
+    train_pairs = generate_qa_dataset(train_facts, style_config, args.augmentations)
+    val_pairs = generate_qa_dataset(val_facts, style_config, args.augmentations)
+    qa_pairs = train_pairs + val_pairs
+    random.shuffle(qa_pairs)
+    print(f"Generated {len(qa_pairs)} unique Q&A pairs from {len(facts)} unique facts")
+
+    # Save combined data for inspection, plus fact-disjoint training splits.
     save_qa_dataset(qa_pairs, args.output)
-    
-    # Create train/val split
-    train_pairs, val_pairs = create_train_val_split(qa_pairs, args.train_ratio, args.seed)
     
     train_path = args.output.replace(".jsonl", "_train.jsonl")
     val_path = args.output.replace(".jsonl", "_val.jsonl")

@@ -1,4 +1,4 @@
-# small-lm: From-Scratch Small Language Model (~70M params)
+# small-lm: From-Scratch Small Language Model (~116M params)
 
 A complete, working implementation of a small decoder-only transformer for chat-style Q&A with a fixed response style.
 
@@ -15,24 +15,24 @@ agent: The capital of France is paris.
 - Proper nouns in answer position are lowercase (e.g., "paris", "london")
 - Template: `"The {property} of {subject} is {value}."`
 
-## Architecture (~70M params)
+## Architecture (default config)
 
 | Component | Specification |
 |-----------|---------------|
 | Type | Decoder-only Transformer |
-| Layers | 8 |
-| Hidden dim (d_model) | 512 |
-| Attention heads | 8 |
-| KV heads | 8 (MHA) |
-| FFN hidden (SwiGLU) | 2048 |
+| Layers | 12 |
+| Hidden dim (d_model) | 768 |
+| Attention heads | 12 |
+| KV heads | 4 (GQA) |
+| FFN hidden (SwiGLU) | 3072 |
 | Max sequence length | 512 |
 | Vocab size | 16,384 |
 | Norm | RMSNorm (pre-norm) |
-| Positional | RoPE (θ=10000) |
+| Positional | RoPE (θ=500,000) |
 | Weight tying | Yes (embeddings ↔ output) |
 | Activation | SwiGLU |
 
-**Exact parameter count:** ~68.7M (printed at startup)
+**Parameter count:** about 116M (printed at startup)
 
 ## File Tree
 
@@ -52,9 +52,11 @@ small-lm/
 │   │   └── dataset.py             # JSONL chat dataset with loss masking
 │   ├── training/
 │   │   ├── train.py               # From-scratch training
-│   │   └── finetune.py            # Fine-tuning with early stopping
+│   │   ├── finetune.py            # Fine-tuning with early stopping
+│   │   └── distributed.py         # torchrun/DDP helpers
 │   ├── inference/
-│   │   └── chat.py                # Interactive CLI with strict mode
+│   │   ├── chat.py                # Interactive CLI with strict mode
+│   │   └── chat_pretrained.py     # Chat with a fine-tuned HF checkpoint
 │   ├── generation/
 │   │   └── generate_data.py       # Synthetic Q&A from facts
 │   └── finetune_pretrained/
@@ -79,17 +81,17 @@ cd /home/starlight/projects/small-lm
 # 1. Install dependencies (auto-detects CUDA/CPU)
 python scripts/setup.py
 
-# 2. Generate synthetic data (2000 facts × 3 augmentations = 6000 Q&A pairs)
+# 2. Generate synthetic data (random combinations for pipeline smoke tests)
 python -m src.generation.generate_data --num-facts 2000 --augmentations 3
 
 # 3. Train tokenizer on generated data
 python -m src.tokenizer.tokenizer
 
-# 4. Train from scratch (~2-4 hours on 8GB GPU)
+# 4. Train from scratch (step count means optimizer updates)
 python -m src.training.train --max-steps 10000
 
 # 5. Fine-tune on same data (lower LR, early stopping)
-python -m src.training.finetune --pretrained checkpoints/pretrain --max-steps 3000
+python -m src.training.finetune --pretrained checkpoints/pretrain/best_model.pt --max-steps 3000
 
 # 6. Chat interactively
 python -m src.inference.chat --checkpoint checkpoints/finetune/best_model.pt
@@ -103,8 +105,8 @@ python -m src.finetune_pretrained.finetune_pretrained \
   --model HuggingFaceTB/SmolLM-135M \
   --max-steps 2000
 
-# Chat with fine-tuned HF model
-python -m src.inference.chat --checkpoint checkpoints/finetune_pretrained/best_model.pt
+# Chat with the fine-tuned HF model
+python -m src.inference.chat_pretrained --checkpoint checkpoints/finetune_pretrained/hf_model
 ```
 
 ## Individual Commands
@@ -121,6 +123,7 @@ python -m src.tokenizer.tokenizer
 # Trains byte-level BPE on data/raw/*.txt, *.jsonl
 # Saves to data/processed/tokenizer/tokenizer.json
 # Special tokens: <|pad|>=0, <|user|>=1, <|agent|>=2, <|end|>=3
+# min_frequency: 2 makes adjacent pairs eligible only after at least two corpus occurrences
 ```
 
 ### Generate Synthetic Data
@@ -133,13 +136,16 @@ python -m src.generation.generate_data --num-facts 5000 --augmentations 5
 # Outputs: data/raw/synthetic_chat.jsonl (+ train/val splits in data/processed/)
 ```
 
+Synthetic facts are arbitrary combinations and are for checking the pipeline. Use a
+real facts CSV/JSON file or the pretrained fine-tuning option for useful factual QA.
+
 ### Train from Scratch
 ```bash
 python -m src.training.train \
   --config configs/model_config.yaml \
   --output-dir checkpoints/pretrain \
   --max-steps 10000 \
-  --batch-size 16
+  --batch-size 4
 ```
 
 **Key features:**
@@ -147,10 +153,25 @@ python -m src.training.train \
 - AdamW (lr=3e-4, wd=0.1, β=(0.9,0.95))
 - Cosine LR with 500-step warmup
 - Gradient clipping (1.0)
-- Gradient accumulation (4 steps → effective batch 64)
+- Gradient accumulation (8 steps by default)
 - Gradient checkpointing
 - Periodic eval (every 500 steps) + sample generation
 - Resume from `checkpoints/pretrain/latest.pt`
+- Dynamic batch padding and lazy JSONL reads reduce GPU and host RAM
+- Loss projection is limited to answer positions to avoid a full `[batch, seq, vocab]` logits allocation
+
+### Multi-GPU training
+
+Launch one process per GPU from the project root. For two GPUs:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=2 -m src.training.train --max-steps 10000
+```
+
+The same launch pattern works for `src.training.finetune` and
+`src.finetune_pretrained.finetune_pretrained`. `batch_size` is per GPU, so the
+effective batch is `batch_size × grad_accum × number of GPUs`. Training uses NCCL
+when available and otherwise falls back to Gloo.
 
 ### Fine-tune (Main Loop for New Data)
 ```bash
@@ -228,8 +249,8 @@ python -m src.inference.chat \
 
 ### OOM (Out of Memory)
 ```bash
-# Reduce batch size
---batch-size 8 --grad-accum 8  # Effective batch 64, lower peak memory
+# Reduce per-GPU batch size
+--batch-size 2 --grad-accum 16  # Keeps the same effective batch with lower peak VRAM
 
 # Enable gradient checkpointing (already on by default)
 # Use fp16 instead of bf16 (slightly less stable but uses less memory)
@@ -248,6 +269,15 @@ max_seq_len: 256 in config
 3. **Learning rate too high**: Try `1e-4` or `5e-5`
 4. **Gradient accumulation**: Ensure effective batch size ≥ 32
 5. **Check masking**: Loss should only be on agent span (verify in dataset.py)
+
+### Loss Falls to Almost Zero Immediately
+
+The old attention mask was reversed, allowing a token to see future answer tokens
+while predicting them. A loss such as `0.0002` from that run is not evidence of
+generalization. The causal attention path is fixed now. Regenerate the tokenizer and
+data, then restart from a fresh checkpoint; old checkpoints were trained with the
+wrong attention behavior. The data generator also splits facts before making question
+variations, so related examples no longer leak between train and validation.
 
 ### Tokenizer Issues
 ```bash
@@ -285,9 +315,9 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 ```
 
 ### Slow Training
-- Enable `torch.compile` in config: `compile: true` (PyTorch 2.0+)
+- Enable `torch.compile` in config only if spare VRAM is available
 - Use `bf16` on Ampere+ GPUs (A100, RTX 30/40 series)
-- Increase `num_workers` in data config (4-8)
+- Increase `num_workers` from 2 if CPU loading is the bottleneck
 - Use `pin_memory: true`
 
 ### Resume Training Fails
@@ -314,6 +344,10 @@ style:           # Response style (template, casing, validation rules)
 data:            # Data loading params
 inference:       # Default generation params
 ```
+
+Memory-oriented defaults use a small per-GPU batch, gradient accumulation,
+gradient checkpointing, dynamic padding, and lazy JSONL reads. `compile` is off by
+default because it can increase peak memory; turn it on when you have spare VRAM.
 
 **Style config example:**
 ```yaml

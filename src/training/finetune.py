@@ -10,8 +10,9 @@ import math
 import time
 import yaml
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass, asdict
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -30,6 +31,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.model.model import SmallLM, ModelConfig
 from src.tokenizer.tokenizer import ChatTokenizer
 from src.data.dataset import create_dataloaders, DataConfig
+from src.training.distributed import (
+    cleanup_distributed, init_distributed, is_main_process,
+    reduce_loss_totals, unwrap_model,
+)
 
 
 @dataclass
@@ -49,12 +54,12 @@ class FinetuneConfig:
     save_interval: int = 500
     log_interval: int = 20
     sample_interval: int = 200
-    batch_size: int = 32
-    grad_accum: int = 2
+    batch_size: int = 4
+    grad_accum: int = 8
     mixed_precision: str = "bf16"
-    compile: bool = True
+    compile: bool = False
     compile_mode: str = "reduce-overhead"
-    gradient_checkpointing: bool = False
+    gradient_checkpointing: bool = True
     seed: int = 42
     output_dir: str = "checkpoints/finetune"
     pretrained_path: str = "checkpoints/pretrain"
@@ -63,6 +68,7 @@ class FinetuneConfig:
     freeze_embeddings: bool = False
     freeze_layers: int = 0
     wandb_project: Optional[str] = None
+    wandb_run_name: Optional[str] = None
 
 
 def set_seed(seed: int):
@@ -111,9 +117,11 @@ def save_checkpoint(
     path: str,
     best_val_loss: Optional[float] = None,
     patience_counter: int = 0,
+    is_best: bool = False,
 ):
     os.makedirs(path, exist_ok=True)
     
+    model = unwrap_model(model)
     checkpoint = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -128,12 +136,17 @@ def save_checkpoint(
     
     torch.save(checkpoint, os.path.join(path, f"step_{step}.pt"))
     
-    latest_path = os.path.join(os.path.dirname(path), "latest.pt")
+    latest_path = os.path.join(path, "latest.pt")
     torch.save(checkpoint, latest_path)
+    model.save_pretrained(path)
     
-    if best_val_loss is not None:
+    if is_best:
         best_path = os.path.join(path, "best_model.pt")
-        torch.save({"model": model.state_dict(), "config": asdict(config), "val_loss": best_val_loss}, best_path)
+        torch.save({
+            "model": model.state_dict(),
+            "model_config": model.config.__dict__,
+            "val_loss": best_val_loss,
+        }, best_path)
     
     print(f"Checkpoint saved: step {step}")
 
@@ -175,13 +188,14 @@ def evaluate(model: SmallLM, val_loader, device: torch.device, amp_dtype: torch.
         labels = batch["labels"].to(device, non_blocking=True)
         
         with get_amp_context(device.type, amp_dtype, amp_dtype != torch.float32):
-            _, loss, _ = model(input_ids, labels)
+            _, loss, _ = model(input_ids, labels, return_logits=False)
         
-        n_tokens = (labels != -100).sum().item()
+        n_tokens = (labels[:, 1:] != -100).sum().item()
         total_loss += loss.item() * n_tokens
         total_tokens += n_tokens
     
     model.train()
+    total_loss, total_tokens = reduce_loss_totals(total_loss, total_tokens, device)
     return total_loss / max(1, total_tokens)
 
 
@@ -250,15 +264,17 @@ def freeze_layers(model: SmallLM, config: FinetuneConfig):
 
 
 def finetune(config: FinetuneConfig):
+    rank, world_size, local_rank, device = init_distributed()
+    main_process = is_main_process()
     set_seed(config.seed)
-    device = get_device()
     amp_dtype = get_amp_dtype(config.mixed_precision)
     
-    print(f"Device: {device}")
-    print(f"Mixed precision: {config.mixed_precision}")
-    print(f"Compile: {config.compile} ({config.compile_mode if config.compile else 'N/A'})")
+    if main_process:
+        print(f"Device: {device} | distributed processes: {world_size}")
+        print(f"Mixed precision: {config.mixed_precision} ({amp_dtype})")
+        print(f"Compile: {config.compile} ({config.compile_mode if config.compile else 'N/A'})")
     
-    if config.wandb_project:
+    if config.wandb_project and main_process:
         import wandb
         wandb.init(
             project=config.wandb_project,
@@ -268,21 +284,36 @@ def finetune(config: FinetuneConfig):
     
     tokenizer = ChatTokenizer()
     
-    print(f"Loading pretrained model from {config.pretrained_path}...")
-    model = SmallLM.from_pretrained(config.pretrained_path, device=str(device))
+    if main_process:
+        print(f"Loading pretrained model from {config.pretrained_path}...")
+    core_model = SmallLM.from_pretrained(config.pretrained_path, device=str(device))
     
-    freeze_layers(model, config)
+    freeze_layers(core_model, config)
+    if config.gradient_checkpointing:
+        core_model.gradient_checkpointing_enable()
     
     if config.compile and hasattr(torch, "compile"):
-        print(f"Compiling model with torch.compile (mode={config.compile_mode})...")
-        model = torch.compile(model, mode=config.compile_mode)
+        if main_process:
+            print(f"Compiling model with torch.compile (mode={config.compile_mode})...")
+        core_model = torch.compile(core_model, mode=config.compile_mode)
+    if world_size > 1:
+        from torch.nn.parallel import DistributedDataParallel
+        model = DistributedDataParallel(
+            core_model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+        )
+    else:
+        model = core_model
+    raw_model = unwrap_model(model)
     
     train_loader, val_loader = create_dataloaders(
         config.train_data,
         tokenizer,
-        DataConfig(max_seq_len=model.config.max_seq_len, seed=config.seed),
+        DataConfig(max_seq_len=raw_model.config.max_seq_len, seed=config.seed),
         config.batch_size,
         val_data_path=config.val_data,
+        distributed=world_size > 1,
     )
     
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -292,7 +323,7 @@ def finetune(config: FinetuneConfig):
         betas=(config.beta1, config.beta2),
         eps=config.eps,
         weight_decay=config.weight_decay,
-        fused=True,
+        fused=device.type == "cuda",
     )
     
     scheduler = get_lr_scheduler(optimizer, config)
@@ -305,21 +336,25 @@ def finetune(config: FinetuneConfig):
     latest_ckpt = os.path.join(config.output_dir, "latest.pt")
     if os.path.exists(latest_ckpt):
         start_step, best_val_loss, patience_counter = load_checkpoint(
-            latest_ckpt, model, optimizer, scheduler, scaler, device
+            latest_ckpt, raw_model, optimizer, scheduler, scaler, device
         )
+    best_val_loss = float("inf") if best_val_loss is None else best_val_loss
     
     model.train()
     step = start_step
     epoch = 0
+    micro_step = step * config.grad_accum
     
-    print(f"Starting fine-tuning from step {step}")
-    print(f"Max steps: {config.max_steps}")
-    print(f"Early stopping patience: {config.early_stopping_patience}")
-    print(f"Effective batch size: {config.batch_size * config.grad_accum}")
+    if main_process:
+        print(f"Starting fine-tuning from optimizer step {step}")
+        print(f"Max steps: {config.max_steps}")
+        print(f"Early stopping patience: {config.early_stopping_patience}")
+        print(f"Effective global batch size: {config.batch_size * config.grad_accum * world_size}")
     
     running_loss = 0.0
     running_tokens = 0
     log_start_time = time.time()
+    optimizer.zero_grad(set_to_none=True)
     
     sample_prompts = [
         "what is the capital of france?",
@@ -332,6 +367,8 @@ def finetune(config: FinetuneConfig):
     
     while step < config.max_steps:
         epoch += 1
+        if hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch - 1)
         
         for batch in train_loader:
             if step >= config.max_steps:
@@ -339,36 +376,40 @@ def finetune(config: FinetuneConfig):
             
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            
-            with get_amp_context(device.type, amp_dtype, amp_dtype != torch.float32):
-                _, loss, _ = model(input_ids, labels)
-                loss = loss / config.grad_accum
-            
-            scaler.scale(loss).backward()
-            
-            if (step + 1) % config.grad_accum == 0:
+            update_step = (micro_step + 1) % config.grad_accum == 0
+            sync_context = model.no_sync() if world_size > 1 and not update_step else nullcontext()
+            with sync_context:
+                with get_amp_context(device.type, amp_dtype, amp_dtype != torch.float32):
+                    _, loss, _ = model(input_ids, labels, return_logits=False)
+                    loss = loss / config.grad_accum
+                scaler.scale(loss).backward()
+            micro_step += 1
+
+            n_tokens = (labels[:, 1:] != -100).sum().item()
+            running_loss += loss.item() * config.grad_accum * n_tokens
+            running_tokens += n_tokens
+
+            if update_step:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
-            
-            n_tokens = (labels != -100).sum().item()
-            running_loss += loss.item() * config.grad_accum * n_tokens
-            running_tokens += n_tokens
-            
-            step += 1
+                step += 1
+            else:
+                continue
             
             if step % config.log_interval == 0:
-                avg_loss = running_loss / max(1, running_tokens)
+                logged_loss, logged_tokens = reduce_loss_totals(running_loss, running_tokens, device)
+                avg_loss = logged_loss / max(1, logged_tokens)
                 lr = scheduler.get_last_lr()[0]
                 elapsed = time.time() - log_start_time
-                tokens_per_sec = running_tokens / elapsed
+                tokens_per_sec = logged_tokens / elapsed
+                if main_process:
+                    print(f"Step {step:6d} | Loss: {avg_loss:.4f} | LR: {lr:.2e} | Tokens/s: {tokens_per_sec:.0f}")
                 
-                print(f"Step {step:6d} | Loss: {avg_loss:.4f} | LR: {lr:.2e} | Tokens/s: {tokens_per_sec:.0f}")
-                
-                if config.wandb_project:
+                if config.wandb_project and main_process:
                     import wandb
                     wandb.log({
                         "train/loss": avg_loss,
@@ -383,43 +424,46 @@ def finetune(config: FinetuneConfig):
             
             if step % config.eval_interval == 0:
                 val_loss = evaluate(model, val_loader, device, amp_dtype)
-                print(f"  Val Loss: {val_loss:.4f} (best: {best_val_loss:.4f}, patience: {patience_counter}/{config.early_stopping_patience})")
+                if main_process:
+                    print(f"  Val Loss: {val_loss:.4f} (best: {best_val_loss:.4f}, patience: {patience_counter}/{config.early_stopping_patience})")
                 
-                if config.wandb_project:
+                if config.wandb_project and main_process:
                     import wandb
                     wandb.log({"val/loss": val_loss, "val/step": step})
                 
                 if val_loss < best_val_loss - config.early_stopping_min_delta:
                     best_val_loss = val_loss
                     patience_counter = 0
-                    save_checkpoint(model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss, patience_counter)
-                    print(f"  New best val loss: {best_val_loss:.4f}")
+                    if main_process:
+                        save_checkpoint(raw_model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss, patience_counter, is_best=True)
+                        print(f"  New best val loss: {best_val_loss:.4f}")
                 else:
                     patience_counter += 1
-                    if patience_counter >= config.early_stopping_patience:
-                        print(f"Early stopping triggered at step {step}")
-                        save_checkpoint(model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss, patience_counter)
-                        if config.wandb_project:
-                            import wandb
-                            wandb.finish()
-                        return
+                    if config.early_stopping_patience > 0 and patience_counter >= config.early_stopping_patience:
+                        if main_process:
+                            print(f"Early stopping triggered at step {step}")
+                        break
             
-            if step % config.sample_interval == 0:
+            if step % config.sample_interval == 0 and main_process:
                 print(f"  Samples at step {step}:")
                 for prompt in sample_prompts:
-                    response = generate_sample(model, tokenizer, prompt, device)
+                    response = generate_sample(raw_model, tokenizer, prompt, device)
                     print(f"    Q: {prompt}")
                     print(f"    A: {response}")
             
-            if step % config.save_interval == 0:
-                save_checkpoint(model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss, patience_counter)
+            if step % config.save_interval == 0 and main_process:
+                save_checkpoint(raw_model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss, patience_counter)
+        if config.early_stopping_patience > 0 and patience_counter >= config.early_stopping_patience:
+            break
     
-    save_checkpoint(model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss, patience_counter)
-    print("Fine-tuning complete!")
+    if main_process:
+        save_checkpoint(raw_model, optimizer, scheduler, scaler, step, config, config.output_dir, best_val_loss, patience_counter)
+        print("Fine-tuning complete!")
     
-    if config.wandb_project:
+    if config.wandb_project and main_process:
         import wandb
         wandb.finish()
+    cleanup_distributed()
 
 
 def load_config(config_path: str = "configs/model_config.yaml") -> FinetuneConfig:
@@ -427,13 +471,13 @@ def load_config(config_path: str = "configs/model_config.yaml") -> FinetuneConfi
         cfg = yaml.safe_load(f)
     ft_cfg = cfg.get("finetune", {})
     train_cfg = cfg.get("training", {})
-    ft_cfg.setdefault("batch_size", train_cfg.get("batch_size", 32))
-    ft_cfg.setdefault("grad_accum", train_cfg.get("grad_accum", 2))
+    ft_cfg.setdefault("batch_size", train_cfg.get("batch_size", 4))
+    ft_cfg.setdefault("grad_accum", train_cfg.get("grad_accum", 8))
     ft_cfg.setdefault("mixed_precision", train_cfg.get("mixed_precision", "bf16"))
-    ft_cfg.setdefault("compile", train_cfg.get("compile", True))
+    ft_cfg.setdefault("compile", train_cfg.get("compile", False))
     ft_cfg.setdefault("compile_mode", train_cfg.get("compile_mode", "reduce-overhead"))
     # Ensure numeric values are proper types
-    for key in ("learning_rate", "min_lr", "weight_decay", "beta1", "beta2", "eps", "max_grad_norm"):
+    for key in ("learning_rate", "min_lr", "weight_decay", "beta1", "beta2", "eps", "max_grad_norm", "early_stopping_min_delta"):
         if key in ft_cfg:
             ft_cfg[key] = float(ft_cfg[key])
     for key in ("batch_size", "grad_accum", "warmup_steps", "max_steps", "eval_interval", "save_interval", "log_interval", "sample_interval", "seed", "early_stopping_patience"):

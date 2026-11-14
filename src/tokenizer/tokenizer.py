@@ -25,7 +25,7 @@ def load_config(config_path: str = "configs/model_config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def build_tokenizer(vocab_size: int = 16384) -> Tokenizer:
+def build_tokenizer(vocab_size: int = 16384, min_frequency: int = 2) -> Tokenizer:
     """Build a byte-level BPE tokenizer with special tokens."""
     tokenizer = Tokenizer(models.BPE(unk_token="<|pad|>"))
     
@@ -42,7 +42,8 @@ def build_tokenizer(vocab_size: int = 16384) -> Tokenizer:
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
         special_tokens=SPECIAL_TOKENS,
-        min_frequency=2,
+        # BPE merges every adjacent pair whose corpus count reaches this value.
+        min_frequency=min_frequency,
         show_progress=True,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
@@ -54,11 +55,12 @@ def train_tokenizer(
     corpus_paths: List[str],
     vocab_size: int = 16384,
     output_dir: str = "data/processed/tokenizer",
+    min_frequency: int = 2,
 ) -> Tokenizer:
     """Train tokenizer on corpus files."""
     os.makedirs(output_dir, exist_ok=True)
     
-    tokenizer, trainer = build_tokenizer(vocab_size)
+    tokenizer, trainer = build_tokenizer(vocab_size, min_frequency)
     
     print(f"Training tokenizer on {len(corpus_paths)} files...")
     tokenizer.train(corpus_paths, trainer)
@@ -67,7 +69,7 @@ def train_tokenizer(
     for tok, expected_id in SPECIAL_TOKEN_MAP.items():
         actual_id = tokenizer.token_to_id(tok)
         if actual_id != expected_id:
-            print(f"Warning: {tok} has ID {actual_id}, expected {expected_id}")
+            raise ValueError(f"Special token {tok} has ID {actual_id}; expected {expected_id}")
     
     # Save
     tokenizer_path = os.path.join(output_dir, "tokenizer.json")
@@ -111,9 +113,11 @@ def encode_chat(tokenizer: Tokenizer, user_text: str, agent_text: str) -> Dict:
     
     # Create labels: -100 for masked positions (user tokens, padding, special)
     labels = [-100] * len(encoding.ids)
-    if agent_start is not None and agent_end is not None and agent_start < agent_end:
+    if agent_start is not None and agent_end is not None:
         for i in range(agent_start, agent_end):
             labels[i] = encoding.ids[i]
+        # Teach the model to stop at the end-of-turn token as well.
+        labels[agent_end] = encoding.ids[agent_end]
     
     return {
         "input_ids": encoding.ids,
@@ -166,11 +170,44 @@ class ChatTokenizer:
         return full_text[start_idx:end_idx]
 
 
+class HuggingFaceChatTokenizer:
+    """Small adapter so the HF fine-tuning path uses its own tokenizer IDs."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.pad_token_id = tokenizer.convert_tokens_to_ids("<|pad|>")
+        self.user_token_id = tokenizer.convert_tokens_to_ids("<|user|>")
+        self.agent_token_id = tokenizer.convert_tokens_to_ids("<|agent|>")
+        self.end_token_id = tokenizer.convert_tokens_to_ids("<|end|>")
+        self.vocab_size = len(tokenizer)
+
+    def encode_user(self, text: str) -> List[int]:
+        formatted = f"<|user|>\n{text}\n<|agent|>\n"
+        return self.tokenizer.encode(formatted, add_special_tokens=False)
+
+    def encode_full(self, user_text: str, agent_text: str) -> Dict:
+        prefix = self.encode_user(user_text)
+        full = f"<|user|>\n{user_text}\n<|agent|>\n{agent_text}<|end|>"
+        input_ids = self.tokenizer.encode(full, add_special_tokens=False)
+        # The added <|agent|> special token makes the prefix stable at this boundary.
+        labels = [-100] * len(input_ids)
+        labels[len(prefix):] = input_ids[len(prefix):]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": [1] * len(input_ids),
+            "labels": labels,
+        }
+
+    def decode(self, token_ids: List[int], skip_special: bool = True) -> str:
+        return self.tokenizer.decode(token_ids, skip_special_tokens=skip_special)
+
+
 if __name__ == "__main__":
     import sys
     
     config = load_config()
     vocab_size = config["model"]["vocab_size"]
+    min_frequency = int(config.get("tokenizer", {}).get("min_frequency", 2))
     
     # Find corpus files
     corpus_dir = Path("data/raw")
@@ -196,6 +233,7 @@ The speed of light is 299792458 meters per second.
     tokenizer = train_tokenizer(
         [str(f) for f in corpus_files],
         vocab_size=vocab_size,
+        min_frequency=min_frequency,
     )
     
     # Test

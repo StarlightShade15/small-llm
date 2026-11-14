@@ -5,12 +5,13 @@ Handles JSONL format, chat templating, loss masking, train/val split.
 import json
 import os
 import random
+from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional, Iterator, Tuple
 from dataclasses import dataclass
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import numpy as np
 
 from src.tokenizer.tokenizer import ChatTokenizer, SPECIAL_TOKEN_MAP
@@ -20,7 +21,7 @@ from src.tokenizer.tokenizer import ChatTokenizer, SPECIAL_TOKEN_MAP
 class DataConfig:
     train_split: float = 0.95
     max_seq_len: int = 512
-    num_workers: int = 4
+    num_workers: int = 0
     prefetch_factor: int = 2
     pin_memory: bool = True
     seed: int = 42
@@ -37,46 +38,45 @@ class ChatDataset(Dataset):
     ):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
-        self.examples = self._load_data(data_path)
-        print(f"Loaded {len(self.examples)} examples from {data_path}")
+        self.data_path = data_path
+        self.offsets = self._index_data(data_path)
+        self._file = None
+        print(f"Indexed {len(self.offsets)} examples from {data_path}")
     
-    def _load_data(self, data_path: str) -> List[Dict]:
-        """Load JSONL data: {"user": "...", "agent": "..."}"""
-        examples = []
-        with open(data_path, "r") as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
+    @staticmethod
+    def _index_data(data_path: str) -> List[int]:
+        """Keep byte offsets instead of all decoded JSON objects in host RAM."""
+        offsets = []
+        with open(data_path, "rb") as data_file:
+            while True:
+                offset = data_file.tell()
+                line = data_file.readline()
                 if not line:
-                    continue
-                try:
-                    ex = json.loads(line)
-                    if "user" in ex and "agent" in ex:
-                        examples.append(ex)
-                    else:
-                        print(f"Warning: Line {line_num} missing 'user' or 'agent' field")
-                except json.JSONDecodeError as e:
-                    print(f"Warning: Line {line_num} JSON decode error: {e}")
-        return examples
+                    break
+                if line.strip():
+                    offsets.append(offset)
+        return offsets
+
+    def __getstate__(self):
+        # DataLoader workers should each lazily open their own file handle.
+        state = self.__dict__.copy()
+        state["_file"] = None
+        return state
     
     def __len__(self) -> int:
-        return len(self.examples)
+        return len(self.offsets)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        ex = self.examples[idx]
+        if self._file is None or self._file.closed:
+            self._file = open(self.data_path, "rb")
+        self._file.seek(self.offsets[idx])
+        ex = json.loads(self._file.readline().decode("utf-8"))
         encoded = self.tokenizer.encode_full(ex["user"], ex["agent"])
         
         # Truncate if too long
         input_ids = encoded["input_ids"][:self.max_seq_len]
         labels = encoded["labels"][:self.max_seq_len]
         attention_mask = encoded["attention_mask"][:self.max_seq_len]
-        
-        # Pad if too short
-        pad_len = self.max_seq_len - len(input_ids)
-        if pad_len > 0:
-            pad_id = SPECIAL_TOKEN_MAP["<|pad|>"]
-            input_ids = input_ids + [pad_id] * pad_len
-            labels = labels + [-100] * pad_len
-            attention_mask = attention_mask + [0] * pad_len
         
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
@@ -91,6 +91,7 @@ def create_dataloaders(
     config: DataConfig,
     batch_size: int,
     val_data_path: Optional[str] = None,
+    distributed: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """Create train and validation dataloaders."""
     
@@ -111,24 +112,31 @@ def create_dataloaders(
         )
         print(f"Split: {train_size} train, {val_size} val")
     
+    train_sampler = DistributedSampler(train_dataset, shuffle=True) if distributed else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False) if distributed else None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=config.num_workers,
         prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
         pin_memory=config.pin_memory,
         drop_last=True,
+        collate_fn=partial(collate_fn, pad_token_id=tokenizer.pad_token_id),
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=config.num_workers,
         prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
         pin_memory=config.pin_memory,
         drop_last=False,
+        collate_fn=partial(collate_fn, pad_token_id=tokenizer.pad_token_id),
     )
     
     return train_loader, val_loader
@@ -190,12 +198,19 @@ class InfiniteDataLoader:
             return next(self.iterator)
 
 
-def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """Custom collate function (default works but this is explicit)."""
+def collate_fn(batch: List[Dict], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
+    """Right-pad to this batch's longest item instead of max_seq_len."""
+    max_len = max(item["input_ids"].shape[0] for item in batch)
+    input_ids, labels, attention_masks = [], [], []
+    for item in batch:
+        pad_len = max_len - item["input_ids"].shape[0]
+        input_ids.append(torch.nn.functional.pad(item["input_ids"], (0, pad_len), value=pad_token_id))
+        labels.append(torch.nn.functional.pad(item["labels"], (0, pad_len), value=-100))
+        attention_masks.append(torch.nn.functional.pad(item["attention_mask"], (0, pad_len), value=0))
     return {
-        "input_ids": torch.stack([b["input_ids"] for b in batch]),
-        "labels": torch.stack([b["labels"] for b in batch]),
-        "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
+        "input_ids": torch.stack(input_ids),
+        "labels": torch.stack(labels),
+        "attention_mask": torch.stack(attention_masks),
     }
 
 
