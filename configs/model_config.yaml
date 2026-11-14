@@ -6,7 +6,7 @@ model:
   n_heads: 12
   n_kv_heads: 4          # GQA: 4 KV heads (3x KV cache reduction)
   ffn_hidden: 3072
-  max_seq_len: 1024
+  max_seq_len: 512
   rope_theta: 500000
   rope_scaling: {"type": "yarn", "factor": 2.0, "original_max_seq_len": 512}
   rmsnorm_eps: 1e-6
@@ -30,10 +30,10 @@ style:
   forbid_exclamation_marks: false
   max_response_length: 128
 
-# Training configuration (optimized for RTX 3090/4090 24GB)
+# Training configuration (optimized for RTX 3080 20GB)
 training:
-  batch_size: 32
-  grad_accum: 2
+  batch_size: 16
+  grad_accum: 4
   learning_rate: 3e-4
   min_lr: 3e-5
   weight_decay: 0.1
@@ -50,7 +50,7 @@ training:
   mixed_precision: "bf16"
   compile: true
   compile_mode: "reduce-overhead"
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   seed: 42
 
 # Fine-tuning configuration (from-scratch model)
