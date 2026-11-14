@@ -320,6 +320,15 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 - Increase `num_workers` from 2 if CPU loading is the bottleneck
 - Use `pin_memory: true`
 
+### `Unexpected key(s) ... "_orig_mod.*"` When Loading
+
+Checkpoints written while the model was wrapped in `torch.compile` carry an
+`_orig_mod.` prefix on every parameter name, and DDP writes `module.`. Loading is
+handled: `strip_wrapper_prefixes` removes either prefix in `SmallLM.from_pretrained`
+and in every training `load_checkpoint`, so old wrapped checkpoints resume without
+rewriting. New checkpoints are saved from the unwrapped model, so they never carry
+the prefix in the first place.
+
 ### Resume Training Fails
 ```bash
 # Check checkpoint exists

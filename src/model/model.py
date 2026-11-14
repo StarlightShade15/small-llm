@@ -33,6 +33,24 @@ class ModelConfig:
     fused_swiglu: bool = True
 
 
+def strip_wrapper_prefixes(state_dict: dict) -> dict:
+    """Remove `_orig_mod.` / `module.` prefixes left by torch.compile and DDP.
+
+    Checkpoints saved while the model was wrapped carry these prefixes in every
+    key, which makes them unloadable into an unwrapped SmallLM. Any depth of
+    nesting is stripped; keys without a prefix pass through untouched.
+    """
+    if not isinstance(state_dict, dict):
+        return state_dict
+    prefixes = ("_orig_mod.", "module.")
+    cleaned = {}
+    for key, value in state_dict.items():
+        while key.startswith(prefixes):
+            key = key.split(".", 1)[1]
+        cleaned[key] = value
+    return cleaned
+
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (compile-friendly)."""
     
@@ -495,12 +513,31 @@ class SmallLM(nn.Module):
     
     @classmethod
     def from_pretrained(cls, path: str, device: str = "cpu") -> "SmallLM":
+        import re
         import yaml, os, glob
+
+        def resolve_model_config(raw) -> dict:
+            """Accept a model dict, a training-config dict holding one, or nothing.
+
+            Training checkpoints store the full TrainConfig under "config", whose
+            "model_config" field is the architecture the run actually used. The
+            saved architecture wins over the default so vocab_size and depth
+            match the weights on disk.
+            """
+            if isinstance(raw, dict):
+                if "d_model" in raw:
+                    return raw
+                for nested_key in ("model_config", "model"):
+                    nested = raw.get(nested_key)
+                    if isinstance(nested, dict) and "d_model" in nested:
+                        return nested
+            return ModelConfig().__dict__
+
         if os.path.isfile(path):
             checkpoint = torch.load(path, map_location="cpu")
-            config_dict = checkpoint.get("model_config", checkpoint.get("config"))
-            if not isinstance(config_dict, dict) or "d_model" not in config_dict:
-                config_dict = ModelConfig().__dict__
+            config_dict = resolve_model_config(
+                checkpoint.get("model_config", checkpoint.get("config"))
+            )
             state_dict = checkpoint.get("model", checkpoint)
         else:
             # Try config.yaml + model.pt first (standard HF-style)
@@ -511,13 +548,13 @@ class SmallLM(nn.Module):
 
             if os.path.exists(config_path):
                 with open(config_path, "r") as f:
-                    config_dict = yaml.safe_load(f)
+                    config_dict = resolve_model_config(yaml.safe_load(f))
                 if os.path.exists(best_path):
                     checkpoint = torch.load(best_path, map_location="cpu")
                     state_dict = checkpoint["model"]
-                    config_dict = checkpoint.get("model_config", config_dict)
-                    if not isinstance(config_dict, dict) or "d_model" not in config_dict:
-                        config_dict = ModelConfig().__dict__
+                    config_dict = resolve_model_config(
+                        checkpoint.get("model_config", config_dict)
+                    )
                 elif os.path.exists(model_pt_path):
                     state_dict = torch.load(model_pt_path, map_location="cpu")
                 else:
@@ -525,25 +562,44 @@ class SmallLM(nn.Module):
             elif os.path.exists(latest_path):
                 # Training checkpoints (latest.pt) contain config in the dict
                 checkpoint = torch.load(latest_path, map_location="cpu")
-                config_dict = checkpoint.get("config", checkpoint.get("model_config"))
-                if not isinstance(config_dict, dict) or "d_model" not in config_dict:
-                    config_dict = ModelConfig().__dict__
+                config_dict = resolve_model_config(
+                    checkpoint.get("config", checkpoint.get("model_config"))
+                )
                 state_dict = checkpoint["model"]
             else:
-                # Fall back to latest step_*.pt
-                step_files = sorted(glob.glob(os.path.join(path, "step_*.pt")))
+                # Fall back to latest step_*.pt (numeric sort: step_10000 follows step_5000)
+                def step_number(file_path: str) -> int:
+                    match = re.search(r"step_(\d+)\.pt$", os.path.basename(file_path))
+                    return int(match.group(1)) if match else -1
+
+                step_files = sorted(glob.glob(os.path.join(path, "step_*.pt")), key=step_number)
                 if step_files:
                     latest_step = step_files[-1]
                     checkpoint = torch.load(latest_step, map_location="cpu")
-                    config_dict = checkpoint.get("config", checkpoint.get("model_config"))
-                    if not isinstance(config_dict, dict) or "d_model" not in config_dict:
-                        config_dict = ModelConfig().__dict__
+                    config_dict = resolve_model_config(
+                        checkpoint.get("config", checkpoint.get("model_config"))
+                    )
                     state_dict = checkpoint["model"]
                 else:
                     raise FileNotFoundError(
                         f"No config.yaml/model.pt/latest.pt/step_*.pt found in {path}"
                     )
+        state_dict = strip_wrapper_prefixes(state_dict)
+        # The embedding rows are authoritative: a checkpoint trained against the
+        # tokenizer's real vocabulary must not inherit the config file's 16384.
+        embedding = state_dict.get("tok_emb.weight")
+        if torch.is_tensor(embedding) and embedding.shape[0] != config_dict.get("vocab_size"):
+            config_dict = dict(config_dict)
+            config_dict["vocab_size"] = int(embedding.shape[0])
         model = cls.from_config(config_dict)
+        # A tied output head may be absent from older checkpoints; the embedding
+        # is the source of truth and the head shares its storage.
+        if (
+            model.config.tie_weights
+            and "head.weight" not in state_dict
+            and "tok_emb.weight" in state_dict
+        ):
+            state_dict["head.weight"] = state_dict["tok_emb.weight"]
         model.load_state_dict(state_dict)
         return model.to(device)
 

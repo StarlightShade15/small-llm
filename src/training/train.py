@@ -30,7 +30,7 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.model.model import SmallLM, ModelConfig
+from src.model.model import SmallLM, ModelConfig, strip_wrapper_prefixes
 from src.tokenizer.tokenizer import ChatTokenizer
 from src.data.dataset import create_dataloaders, DataConfig
 from src.training.distributed import (
@@ -166,7 +166,7 @@ def load_checkpoint(
     """Load training checkpoint."""
     checkpoint = torch.load(path, map_location=device)
     
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(strip_wrapper_prefixes(checkpoint["model"]))
     step = checkpoint.get("step", 0)
     best_val_loss = checkpoint.get("best_val_loss")
     
