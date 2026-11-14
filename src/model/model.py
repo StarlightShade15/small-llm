@@ -200,6 +200,7 @@ class Attention(nn.Module):
         sin: Tensor,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[Tuple[Tensor, Tensor]] = None,
+        use_cache: bool = False,
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         bsz, seq_len, _ = x.shape
         
@@ -217,7 +218,10 @@ class Attention(nn.Module):
             k = torch.cat([k_cache, k], dim=1)
             v = torch.cat([v_cache, v], dim=1)
         
-        new_kv_cache = (k, v) if kv_cache is not None else None
+        # The cache must be returned even on the pass that carries the prompt,
+        # otherwise the prompt's keys and values are dropped and every generated
+        # token is conditioned on itself alone.
+        new_kv_cache = (k, v) if use_cache else None
         
         # Transpose for attention: (bsz, n_heads, seq_len, head_dim)
         q = q.transpose(1, 2)
@@ -291,11 +295,12 @@ class TransformerBlock(nn.Module):
         sin: Tensor,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[Tuple[Tensor, Tensor]] = None,
+        use_cache: bool = False,
     ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         # Pre-norm attention
         residual = x
         x = self.attn_norm(x)
-        x, kv_cache = self.attn(x, cos, sin, mask, kv_cache)
+        x, kv_cache = self.attn(x, cos, sin, mask, kv_cache, use_cache)
         x = x + residual
         
         # Pre-norm FFN
@@ -371,12 +376,15 @@ class SmallLM(nn.Module):
         labels: Optional[Tensor] = None,
         kv_cache: Optional[List[Tuple[Tensor, Tensor]]] = None,
         return_logits: bool = True,
+        use_cache: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[List[Tuple[Tensor, Tensor]]]]:
         """
         Args:
             input_ids: (batch, seq_len)
             labels: (batch, seq_len) with -100 for masked positions
             kv_cache: List of (k, v) per layer for inference
+            use_cache: build and return the KV cache. Required on the prompt
+                pass too, not just the token-by-token passes.
         Returns:
             logits: (batch, seq_len, vocab_size), or None when labels are supplied
                 and return_logits=False
@@ -402,24 +410,24 @@ class SmallLM(nn.Module):
         mask = None
         
         # Forward through blocks
-        new_kv_cache = [] if kv_cache is not None else None
+        new_kv_cache = [] if use_cache else None
         for i, block in enumerate(self.blocks):
             layer_kv = kv_cache[i] if kv_cache is not None else None
             
             if getattr(self, '_gradient_checkpointing', False) and self.training and labels is not None:
                 # Use gradient checkpointing for memory efficiency
                 def create_custom_forward(module):
-                    def custom_forward(x, cos, sin, mask, kv_cache):
-                        return module(x, cos, sin, mask, kv_cache)
+                    def custom_forward(x, cos, sin, mask, kv_cache, use_cache):
+                        return module(x, cos, sin, mask, kv_cache, use_cache)
                     return custom_forward
                 
                 x, layer_kv = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
-                    x, cos, sin, mask, layer_kv,
+                    x, cos, sin, mask, layer_kv, use_cache,
                     use_reentrant=False,
                 )
             else:
-                x, layer_kv = block(x, cos, sin, mask, layer_kv)
+                x, layer_kv = block(x, cos, sin, mask, layer_kv, use_cache)
             
             if new_kv_cache is not None:
                 new_kv_cache.append(layer_kv)
@@ -469,10 +477,14 @@ class SmallLM(nn.Module):
         bsz = input_ids.shape[0]
         kv_cache = None
         
-        # Pre-allocate for speed
         current_input = input_ids
         for _ in range(max_new_tokens):
-            logits, _, kv_cache = self.forward(current_input, kv_cache=kv_cache)
+            # use_cache must be set on the prompt pass as well: without it the
+            # prompt's keys and values are discarded and every generated token
+            # is conditioned on itself alone.
+            logits, _, kv_cache = self.forward(
+                current_input, kv_cache=kv_cache, use_cache=True
+            )
             next_logits = logits[:, -1, :] / temperature
             
             # Repetition penalty (vectorized)

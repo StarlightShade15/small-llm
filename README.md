@@ -42,7 +42,8 @@ small-lm/
 │   └── model_config.yaml          # All configuration (model, training, style, data)
 ├── scripts/
 │   ├── setup.py                   # Install dependencies (auto-detects CUDA)
-│   └── run.py                     # Main entry point (pipeline orchestrator)
+│   ├── run.py                     # Main entry point (pipeline orchestrator)
+│   └── test_kv_cache.py           # Regression test: cached decode == full recompute
 ├── src/
 │   ├── tokenizer/
 │   │   └── tokenizer.py           # Byte-level BPE tokenizer + chat encoding
@@ -300,6 +301,24 @@ print('Special:', tok.pad_token_id, tok.user_token_id, tok.agent_token_id, tok.e
 - **Check**: During training, sample generations should show proper format
 
 ### Model Outputs Gibberish / Repeats
+
+First, check the KV cache, because a broken cache produces exactly this and no
+sampling setting will fix it:
+
+```bash
+python scripts/test_kv_cache.py
+# PASS: KV cache decode matches full recompute
+```
+
+The cached greedy decode and the full-recompute greedy decode must produce the
+same tokens. They did not: the prompt pass did not build a cache, so the
+prompt's keys and values were thrown away and every generated token was
+conditioned on itself alone. Training was never affected, which is why the loss
+looked healthy while the samples were word salad. `use_cache` is now threaded
+through `Attention`, `TransformerBlock`, and `SmallLM.forward`, and `generate`
+sets it on every pass including the prompt.
+
+Then the usual suspects:
 - **Temperature too high**: Try `--temperature 0.3`
 - **Repetition penalty**: Increase `--repetition-penalty 1.2`
 - **Top-k/Top-p too restrictive**: Try `--top-k 100 --top-p 0.95`
