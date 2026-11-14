@@ -500,7 +500,7 @@ class SmallLM(nn.Module):
             checkpoint = torch.load(path, map_location="cpu")
             config_dict = checkpoint.get("model_config", checkpoint.get("config"))
             if not isinstance(config_dict, dict) or "d_model" not in config_dict:
-                raise ValueError(f"Checkpoint at {path} does not include a model configuration")
+                config_dict = ModelConfig().__dict__
             state_dict = checkpoint.get("model", checkpoint)
         else:
             # Try config.yaml + model.pt first (standard HF-style)
@@ -516,6 +516,8 @@ class SmallLM(nn.Module):
                     checkpoint = torch.load(best_path, map_location="cpu")
                     state_dict = checkpoint["model"]
                     config_dict = checkpoint.get("model_config", config_dict)
+                    if not isinstance(config_dict, dict) or "d_model" not in config_dict:
+                        config_dict = ModelConfig().__dict__
                 elif os.path.exists(model_pt_path):
                     state_dict = torch.load(model_pt_path, map_location="cpu")
                 else:
@@ -525,7 +527,7 @@ class SmallLM(nn.Module):
                 checkpoint = torch.load(latest_path, map_location="cpu")
                 config_dict = checkpoint.get("config", checkpoint.get("model_config"))
                 if not isinstance(config_dict, dict) or "d_model" not in config_dict:
-                    raise ValueError(f"Checkpoint at {latest_path} does not include a model configuration")
+                    config_dict = ModelConfig().__dict__
                 state_dict = checkpoint["model"]
             else:
                 # Fall back to latest step_*.pt
@@ -535,7 +537,7 @@ class SmallLM(nn.Module):
                     checkpoint = torch.load(latest_step, map_location="cpu")
                     config_dict = checkpoint.get("config", checkpoint.get("model_config"))
                     if not isinstance(config_dict, dict) or "d_model" not in config_dict:
-                        raise ValueError(f"Checkpoint at {latest_step} does not include a model configuration")
+                        config_dict = ModelConfig().__dict__
                     state_dict = checkpoint["model"]
                 else:
                     raise FileNotFoundError(
