@@ -485,7 +485,11 @@ class SmallLM(nn.Module):
             logits, _, kv_cache = self.forward(
                 current_input, kv_cache=kv_cache, use_cache=True
             )
-            next_logits = logits[:, -1, :] / temperature
+            if temperature > 0.0:
+                next_logits = logits[:, -1, :] / temperature
+            else:
+                # Greedy mode: use the raw logits.
+                next_logits = logits[:, -1, :]
             
             # Repetition penalty (vectorized)
             if repetition_penalty != 1.0:
@@ -508,8 +512,12 @@ class SmallLM(nn.Module):
                 sorted_mask[:, 0] = False
                 next_logits.scatter_(1, sorted_indices, next_logits.gather(1, sorted_indices).masked_fill(sorted_mask, float("-inf")))
             
-            probs = F.softmax(next_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            if temperature <= 0.0:
+                # Greedy: argmax over the filtered logits.
+                next_token = next_logits.argmax(dim=-1, keepdim=True)
+            else:
+                probs = F.softmax(next_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
             
             input_ids = torch.cat([input_ids, next_token], dim=1)
             current_input = next_token

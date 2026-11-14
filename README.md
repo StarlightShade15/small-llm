@@ -43,6 +43,7 @@ small-lm/
 ├── scripts/
 │   ├── setup.py                   # Install dependencies (auto-detects CUDA)
 │   ├── run.py                     # Main entry point (pipeline orchestrator)
+│   ├── eval_facts.py              # Score a checkpoint against a facts CSV
 │   └── test_kv_cache.py           # Regression test: cached decode == full recompute
 ├── src/
 │   ├── tokenizer/
@@ -201,6 +202,20 @@ python -m src.finetune_pretrained.finetune_pretrained \
   --max-steps 2000 \
   --lr 5e-5
 ```
+
+### Score Against Real Facts
+
+```bash
+python scripts/eval_facts.py \
+  --checkpoint checkpoints/finetune_real/best_model.pt \
+  --facts data/raw/sample_facts.csv
+```
+
+Greedy decoding over every question variant of every fact, reported as exact
+answer, value accuracy, template conformance and style cleanliness. `--verbose`
+prints every answer, `--questions first` scores one phrasing per fact, and
+`--max-facts N` limits the run. This is the number to watch while fine-tuning:
+the six samples in the training log show shape, not accuracy.
 
 ### Chat / Inference
 ```bash
