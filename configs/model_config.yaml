@@ -1,0 +1,79 @@
+# Model architecture configuration (~156M parameters, optimized for RTX 5070 Ti 16GB)
+model:
+  vocab_size: 16384
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  n_kv_heads: 4          # GQA: 4 KV heads (3x KV cache reduction)
+  ffn_hidden: 3072
+  max_seq_len: 1024
+  rope_theta: 500000
+  rope_scaling: {"type": "yarn", "factor": 2.0, "original_max_seq_len": 512}
+  rmsnorm_eps: 1e-6
+  initializer_range: 0.02
+  tie_weights: true
+  use_bias: false
+
+# Special tokens (must match tokenizer)
+special_tokens:
+  pad_token: "<|pad|>"
+  user_token: "<|user|>"
+  agent_token: "<|agent|>"
+  end_token: "<|end|>"
+
+# Style configuration (fully configurable)
+style:
+  template: "The {property} of {subject} is {value}."
+  value_casing: "lower"
+  require_period: true
+  forbid_question_marks: true
+  forbid_exclamation_marks: false
+  max_response_length: 128
+
+# Training configuration (optimized for RTX 5070 Ti 16GB)
+training:
+  batch_size: 32
+  grad_accum: 2
+  learning_rate: 3e-4
+  min_lr: 3e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1e-8
+  max_grad_norm: 1.0
+  warmup_steps: 1000
+  max_steps: 15000
+  eval_interval: 500
+  save_interval: 1000
+  log_interval: 25
+  sample_interval: 500
+  mixed_precision: "bf16"
+  compile: true
+  gradient_checkpointing: false
+  seed: 42
+
+# Fine-tuning configuration
+finetune:
+  learning_rate: 5e-5
+  min_lr: 5e-6
+  max_steps: 5000
+  early_stopping_patience: 3
+  early_stopping_min_delta: 1e-4
+  weight_decay: 0.05
+  batch_size: 32
+  grad_accum: 2
+
+# Inference configuration
+inference:
+  temperature: 0.7
+  top_k: 50
+  top_p: 0.9
+  max_new_tokens: 128
+  repetition_penalty: 1.1
+
+# Data configuration
+data:
+  train_split: 0.95
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true

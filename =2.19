@@ -1,0 +1,42 @@
+Collecting datasets
+  Downloading datasets-5.2.0-py3-none-any.whl.metadata (24 kB)
+Requirement already satisfied: filelock in /home/starlight/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/site-packages (from datasets) (4.2.4)
+Requirement already satisfied: numpy>=1.17 in /home/starlight/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/site-packages (from datasets) (2.5.4)
+Collecting pyarrow>=24.0.0 (from datasets)
+  Downloading pyarrow-26.0.1-cp314-cp314-manylinux_2_28_x86_64.whl.metadata (3.0 kB)
+Collecting dill<0.4.2,>=0.3.0 (from datasets)
+  Downloading dill-0.4.1-py3-none-any.whl.metadata (10 kB)
+Collecting pandas (from datasets)
+  Downloading pandas-3.1.1-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (16 kB)
+Requirement already satisfied: tqdm>=4.66.3 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from datasets) (4.70.1)
+Collecting xxhash (from datasets)
+  Downloading xxhash-4.1.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (18 kB)
+Collecting multiprocess<0.70.20 (from datasets)
+  Downloading multiprocess-0.70.19-py314-none-any.whl.metadata (7.2 kB)
+Requirement already satisfied: fsspec<=2026.9.0,>=2023.1.0 in /home/starlight/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/site-packages (from datasets) (2026.9.0)
+Requirement already satisfied: huggingface-hub<3.0,>=1.31.0 in /home/starlight/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/site-packages (from datasets) (2.4.0)
+Requirement already satisfied: packaging in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from datasets) (26.3)
+Requirement already satisfied: pyyaml>=5.1 in /home/starlight/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/site-packages (from datasets) (6.0.3)
+Requirement already satisfied: click<9.0.0,>=8.4.2 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from huggingface-hub<3.0,>=1.31.0->datasets) (8.5.0)
+Requirement already satisfied: hf-xet<2.0.0,>=1.6.0 in /home/starlight/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/site-packages (from huggingface-hub<3.0,>=1.31.0->datasets) (1.8.0)
+Requirement already satisfied: httpx2<3,>=2.0.0 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from huggingface-hub<3.0,>=1.31.0->datasets) (2.15.1)
+Requirement already satisfied: typing-extensions>=4.1.0 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from huggingface-hub<3.0,>=1.31.0->datasets) (4.16.0)
+Requirement already satisfied: anyio>=4.10 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from httpx2<3,>=2.0.0->huggingface-hub<3.0,>=1.31.0->datasets) (4.15.1)
+Requirement already satisfied: httpcore2==2.15.1 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from httpx2<3,>=2.0.0->huggingface-hub<3.0,>=1.31.0->datasets) (2.15.1)
+Requirement already satisfied: idna>=3.18 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from httpx2<3,>=2.0.0->huggingface-hub<3.0,>=1.31.0->datasets) (3.20)
+Requirement already satisfied: truststore>=0.10 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from httpx2<3,>=2.0.0->huggingface-hub<3.0,>=1.31.0->datasets) (0.10.5)
+Requirement already satisfied: h11>=0.16 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from httpcore2==2.15.1->httpx2<3,>=2.0.0->huggingface-hub<3.0,>=1.31.0->datasets) (0.16.0)
+Requirement already satisfied: python-dateutil>=2.9.0 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from pandas->datasets) (2.9.0.post0)
+Requirement already satisfied: six>=1.5 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from python-dateutil>=2.9.0->pandas->datasets) (1.17.0)
+Downloading datasets-5.2.0-py3-none-any.whl (608 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 608.3/608.3 kB 5.4 MB/s  0:00:00
+Downloading dill-0.4.1-py3-none-any.whl (120 kB)
+Downloading multiprocess-0.70.19-py314-none-any.whl (160 kB)
+Downloading pyarrow-26.0.1-cp314-cp314-manylinux_2_28_x86_64.whl (55.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 55.1/55.1 MB 93.0 MB/s  0:00:00
+Downloading pandas-3.1.1-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (12.0 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 12.0/12.0 MB 120.4 MB/s  0:00:00
+Downloading xxhash-4.1.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (478 kB)
+Installing collected packages: xxhash, pyarrow, dill, pandas, multiprocess, datasets
+
+Successfully installed datasets-5.2.0 dill-0.4.1 multiprocess-0.70.19 pandas-3.1.1 pyarrow-26.0.1 xxhash-4.1.0

@@ -1,0 +1,28 @@
+Collecting tokenizers
+  Downloading tokenizers-0.23.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (9.8 kB)
+Collecting huggingface-hub<3.0,>=0.16.4 (from tokenizers)
+  Downloading huggingface_hub-2.4.0-py3-none-any.whl.metadata (16 kB)
+Requirement already satisfied: click<9.0.0,>=8.4.2 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from huggingface-hub<3.0,>=0.16.4->tokenizers) (8.5.0)
+Requirement already satisfied: filelock>=3.10.0 in /home/starlight/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/site-packages (from huggingface-hub<3.0,>=0.16.4->tokenizers) (4.2.4)
+Requirement already satisfied: fsspec>=2023.5.0 in /home/starlight/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/site-packages (from huggingface-hub<3.0,>=0.16.4->tokenizers) (2026.9.0)
+Collecting hf-xet<2.0.0,>=1.6.0 (from huggingface-hub<3.0,>=0.16.4->tokenizers)
+  Downloading hf_xet-1.8.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (4.9 kB)
+Requirement already satisfied: httpx2<3,>=2.0.0 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from huggingface-hub<3.0,>=0.16.4->tokenizers) (2.15.1)
+Requirement already satisfied: packaging>=20.9 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from huggingface-hub<3.0,>=0.16.4->tokenizers) (26.3)
+Requirement already satisfied: pyyaml>=5.1 in /home/starlight/.hermes/tools/python-3.14.9+20261021-linux-x64/lib/python3.14/site-packages (from huggingface-hub<3.0,>=0.16.4->tokenizers) (6.0.3)
+Requirement already satisfied: tqdm>=4.42.1 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from huggingface-hub<3.0,>=0.16.4->tokenizers) (4.70.1)
+Requirement already satisfied: typing-extensions>=4.1.0 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from huggingface-hub<3.0,>=0.16.4->tokenizers) (4.16.0)
+Requirement already satisfied: anyio>=4.10 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from httpx2<3,>=2.0.0->huggingface-hub<3.0,>=0.16.4->tokenizers) (4.15.1)
+Requirement already satisfied: httpcore2==2.15.1 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from httpx2<3,>=2.0.0->huggingface-hub<3.0,>=0.16.4->tokenizers) (2.15.1)
+Requirement already satisfied: idna>=3.18 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from httpx2<3,>=2.0.0->huggingface-hub<3.0,>=0.16.4->tokenizers) (3.20)
+Requirement already satisfied: truststore>=0.10 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from httpx2<3,>=2.0.0->huggingface-hub<3.0,>=0.16.4->tokenizers) (0.10.5)
+Requirement already satisfied: h11>=0.16 in /home/starlight/.hermes/installs/e21fd51b2e709ebb/environments/497fb11551364662b1466decaf42f46e/venv/lib/python3.14/site-packages (from httpcore2==2.15.1->httpx2<3,>=2.0.0->huggingface-hub<3.0,>=0.16.4->tokenizers) (0.16.0)
+Downloading tokenizers-0.23.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (3.4 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.4/3.4 MB 66.5 MB/s  0:00:00
+Downloading huggingface_hub-2.4.0-py3-none-any.whl (857 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 857.0/857.0 kB 10.0 MB/s  0:00:00
+Downloading hf_xet-1.8.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (4.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.3/4.3 MB 39.8 MB/s  0:00:00
+Installing collected packages: hf-xet, huggingface-hub, tokenizers
+
+Successfully installed hf-xet-1.8.0 huggingface-hub-2.4.0 tokenizers-0.23.3
