@@ -495,7 +495,7 @@ class SmallLM(nn.Module):
     
     @classmethod
     def from_pretrained(cls, path: str, device: str = "cpu") -> "SmallLM":
-        import yaml, os
+        import yaml, os, glob
         if os.path.isfile(path):
             checkpoint = torch.load(path, map_location="cpu")
             config_dict = checkpoint.get("model_config", checkpoint.get("config"))
@@ -503,15 +503,44 @@ class SmallLM(nn.Module):
                 raise ValueError(f"Checkpoint at {path} does not include a model configuration")
             state_dict = checkpoint.get("model", checkpoint)
         else:
-            with open(os.path.join(path, "config.yaml"), "r") as f:
-                config_dict = yaml.safe_load(f)
+            # Try config.yaml + model.pt first (standard HF-style)
+            config_path = os.path.join(path, "config.yaml")
+            model_pt_path = os.path.join(path, "model.pt")
             best_path = os.path.join(path, "best_model.pt")
-            if os.path.exists(best_path):
-                checkpoint = torch.load(best_path, map_location="cpu")
+            latest_path = os.path.join(path, "latest.pt")
+
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config_dict = yaml.safe_load(f)
+                if os.path.exists(best_path):
+                    checkpoint = torch.load(best_path, map_location="cpu")
+                    state_dict = checkpoint["model"]
+                    config_dict = checkpoint.get("model_config", config_dict)
+                elif os.path.exists(model_pt_path):
+                    state_dict = torch.load(model_pt_path, map_location="cpu")
+                else:
+                    raise FileNotFoundError(f"No model weights found in {path}")
+            elif os.path.exists(latest_path):
+                # Training checkpoints (latest.pt) contain config in the dict
+                checkpoint = torch.load(latest_path, map_location="cpu")
+                config_dict = checkpoint.get("config", checkpoint.get("model_config"))
+                if not isinstance(config_dict, dict) or "d_model" not in config_dict:
+                    raise ValueError(f"Checkpoint at {latest_path} does not include a model configuration")
                 state_dict = checkpoint["model"]
-                config_dict = checkpoint.get("model_config", config_dict)
             else:
-                state_dict = torch.load(os.path.join(path, "model.pt"), map_location="cpu")
+                # Fall back to latest step_*.pt
+                step_files = sorted(glob.glob(os.path.join(path, "step_*.pt")))
+                if step_files:
+                    latest_step = step_files[-1]
+                    checkpoint = torch.load(latest_step, map_location="cpu")
+                    config_dict = checkpoint.get("config", checkpoint.get("model_config"))
+                    if not isinstance(config_dict, dict) or "d_model" not in config_dict:
+                        raise ValueError(f"Checkpoint at {latest_step} does not include a model configuration")
+                    state_dict = checkpoint["model"]
+                else:
+                    raise FileNotFoundError(
+                        f"No config.yaml/model.pt/latest.pt/step_*.pt found in {path}"
+                    )
         model = cls.from_config(config_dict)
         model.load_state_dict(state_dict)
         return model.to(device)
