@@ -414,6 +414,13 @@ def load_config(config_path: str = "configs/model_config.yaml") -> FinetuneConfi
     ft_cfg.setdefault("mixed_precision", train_cfg.get("mixed_precision", "bf16"))
     ft_cfg.setdefault("compile", train_cfg.get("compile", True))
     ft_cfg.setdefault("compile_mode", train_cfg.get("compile_mode", "reduce-overhead"))
+    # Ensure numeric values are proper types
+    for key in ("learning_rate", "min_lr", "weight_decay", "beta1", "beta2", "eps", "max_grad_norm"):
+        if key in ft_cfg:
+            ft_cfg[key] = float(ft_cfg[key])
+    for key in ("batch_size", "grad_accum", "warmup_steps", "max_steps", "eval_interval", "save_interval", "log_interval", "sample_interval", "seed", "early_stopping_patience"):
+        if key in ft_cfg:
+            ft_cfg[key] = int(ft_cfg[key])
     return FinetuneConfig(**ft_cfg)
 
 

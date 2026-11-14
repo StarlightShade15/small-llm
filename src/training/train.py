@@ -405,6 +405,13 @@ def load_config(config_path: str = "configs/model_config.yaml") -> TrainConfig:
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
     train_cfg = cfg.get("training", {})
+    # Ensure numeric values are proper types (YAML may parse scientific notation as strings)
+    for key in ("learning_rate", "min_lr", "weight_decay", "beta1", "beta2", "eps", "max_grad_norm"):
+        if key in train_cfg:
+            train_cfg[key] = float(train_cfg[key])
+    for key in ("batch_size", "grad_accum", "warmup_steps", "max_steps", "eval_interval", "save_interval", "log_interval", "sample_interval", "seed"):
+        if key in train_cfg:
+            train_cfg[key] = int(train_cfg[key])
     return TrainConfig(**train_cfg)
 
 
