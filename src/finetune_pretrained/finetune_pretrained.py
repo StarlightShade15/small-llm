@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.data.dataset import create_dataloaders, DataConfig
 from src.model.model import strip_wrapper_prefixes
 from src.tokenizer.tokenizer import HuggingFaceChatTokenizer
+from src.training.checkpoint_io import save_checkpoint_files
 from src.training.distributed import (
     cleanup_distributed, init_distributed, is_main_process,
     reduce_loss_totals, unwrap_model,
@@ -135,21 +136,31 @@ def save_checkpoint(
     }
     if scaler is not None:
         checkpoint["scaler"] = scaler.state_dict()
-    
-    torch.save(checkpoint, os.path.join(path, f"step_{step}.pt"))
-    
-    latest_path = os.path.join(path, "latest.pt")
-    torch.save(checkpoint, latest_path)
-    
+
+    best_payload = None
+    best_path = os.path.join(path, "best_model.pt")
     if best_val_loss is not None:
-        best_path = os.path.join(path, "best_model.pt")
-        torch.save({"model": model.state_dict(), "config": asdict(config), "val_loss": best_val_loss}, best_path)
-    
+        best_payload = {
+            "model": model.state_dict(),
+            "config": asdict(config),
+            "val_loss": best_val_loss,
+        }
+
+    wrote = save_checkpoint_files(
+        checkpoint, path, step, best=best_payload, best_path=best_path
+    )
+
     # Also save in HF format for easy loading
     hf_path = os.path.join(path, "hf_model")
-    model.save_pretrained(hf_path)
-    
-    print(f"Checkpoint saved: step {step}")
+    try:
+        model.save_pretrained(hf_path)
+    except (OSError, RuntimeError) as exc:
+        print(f"[checkpoint] hf_model write failed: {exc}")
+
+    if wrote:
+        print(f"Checkpoint saved: step {step}")
+    else:
+        print(f"Checkpoint skipped at step {step}: not enough disk space in {path}")
 
 
 def load_checkpoint(

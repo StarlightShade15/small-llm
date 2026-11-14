@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.model.model import SmallLM, ModelConfig, strip_wrapper_prefixes
 from src.tokenizer.tokenizer import ChatTokenizer
 from src.data.dataset import create_dataloaders, DataConfig
+from src.training.checkpoint_io import save_checkpoint_files
 from src.training.distributed import (
     cleanup_distributed, init_distributed, is_main_process,
     reduce_loss_totals, unwrap_model,
@@ -138,21 +139,31 @@ def save_checkpoint(
     }
     if scaler is not None:
         checkpoint["scaler"] = scaler.state_dict()
-    
-    torch.save(checkpoint, os.path.join(path, f"step_{step}.pt"))
-    
-    # Also save latest
-    latest_path = os.path.join(path, "latest.pt")
-    torch.save(checkpoint, latest_path)
-    model.save_pretrained(path)
+
+    best_payload = None
+    best_path = os.path.join(path, "best_model.pt")
     if is_best:
-        torch.save({
+        best_payload = {
             "model": model.state_dict(),
             "model_config": model.config.__dict__,
             "val_loss": best_val_loss,
-        }, os.path.join(path, "best_model.pt"))
-    
-    print(f"Checkpoint saved: step {step}")
+        }
+
+    wrote = save_checkpoint_files(
+        checkpoint, path, step, best=best_payload, best_path=best_path
+    )
+
+    # model.pt + config.yaml are the plain-load artifacts; a failed write here
+    # must not kill a run whose training checkpoint is already on disk.
+    try:
+        model.save_pretrained(path)
+    except (OSError, RuntimeError) as exc:
+        print(f"[checkpoint] model.pt write failed: {exc}")
+
+    if wrote:
+        print(f"Checkpoint saved: step {step}")
+    else:
+        print(f"Checkpoint skipped at step {step}: not enough disk space in {path}")
 
 
 def load_checkpoint(

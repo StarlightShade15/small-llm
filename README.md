@@ -329,6 +329,30 @@ and in every training `load_checkpoint`, so old wrapped checkpoints resume witho
 rewriting. New checkpoints are saved from the unwrapped model, so they never carry
 the prefix in the first place.
 
+### Disk Fills During Training
+
+A full checkpoint is ~1.4 GB (116M fp32 weights plus two AdamW moment buffers),
+and each save wrote `step_N.pt`, `latest.pt`, `model.pt` and `best_model.pt` as
+four separate files. At an eval interval of 100 steps that is ~3.7 GB per save
+event, which fills a container volume fast. `RuntimeError: basic_ios::clear:
+iostream error` from `torch.save` is the disk hitting that wall mid-write.
+
+Checkpoints are now written through a temp file and renamed into place, so a
+failed write leaves the previous `latest.pt` intact instead of a torn file. Only
+the two newest `step_*.pt` files are kept, `latest.pt` is hard-linked to the
+current step file instead of duplicating 1.4 GB, `best_model.pt` is written
+before the heavier files, and a save is skipped with a clear message when the
+volume cannot hold it.
+
+```bash
+df -h /workspace                       # free space on the volume
+du -sh checkpoints/*                   # what the checkpoints are costing
+rm -f checkpoints/finetune/step_200.pt # delete a torn write
+```
+
+Resume from the surviving `latest.pt` — the run picks up the optimizer step it
+was written at.
+
 ### Resume Training Fails
 ```bash
 # Check checkpoint exists
