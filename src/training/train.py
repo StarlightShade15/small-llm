@@ -18,7 +18,11 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.cuda.amp import GradScaler, autocast
+# Support both old and new PyTorch amp APIs
+try:
+    from torch.amp import GradScaler, autocast
+except ImportError:
+    from torch.cuda.amp import GradScaler, autocast
 from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
@@ -170,7 +174,7 @@ def evaluate(model: SmallLM, val_loader, device: torch.device, amp_dtype: torch.
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
         
-        with autocast(device_type=device.type, dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
+        with get_amp_context(device.type, amp_dtype, amp_dtype != torch.float32):
             _, loss, _ = model(input_ids, labels)
         
         n_tokens = (labels != -100).sum().item()
@@ -213,6 +217,20 @@ def generate_sample(
     
     model.train()
     return response.strip()
+
+
+def get_amp_context(device_type: str, dtype: torch.dtype, enabled: bool):
+    """Get autocast context manager compatible with old and new PyTorch."""
+    if enabled and dtype != torch.float32:
+        try:
+            # New API (PyTorch 2.4+)
+            return torch.amp.autocast(device_type=device_type, dtype=dtype)
+        except TypeError:
+            # Old API
+            return torch.cuda.amp.autocast(dtype=dtype)
+    # No-op context manager
+    from contextlib import nullcontext
+    return nullcontext()
 
 
 def train(config: TrainConfig):
@@ -318,7 +336,7 @@ def train(config: TrainConfig):
             labels = batch["labels"].to(device, non_blocking=True)
             
             # Forward with mixed precision
-            with autocast(device_type=device.type, dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
+            with get_amp_context(device.type, amp_dtype, amp_dtype != torch.float32):
                 _, loss, _ = model(input_ids, labels)
                 loss = loss / config.grad_accum
             

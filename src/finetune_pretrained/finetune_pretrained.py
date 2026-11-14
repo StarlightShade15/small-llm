@@ -17,7 +17,11 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.cuda.amp import GradScaler, autocast
+# Support both old and new PyTorch amp APIs
+try:
+    from torch.amp import GradScaler, autocast
+except ImportError:
+    from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -177,7 +181,7 @@ def evaluate(model: nn.Module, val_loader, device: torch.device, amp_dtype: torc
         labels = batch["labels"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         
-        with autocast(device_type=device.type, dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
+        with get_amp_context(device.type, amp_dtype, amp_dtype != torch.float32):
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
         
@@ -229,6 +233,20 @@ def generate_sample(
     
     model.train()
     return response.strip()
+
+
+def get_amp_context(device_type: str, dtype: torch.dtype, enabled: bool):
+    """Get autocast context manager compatible with old and new PyTorch."""
+    if enabled and dtype != torch.float32:
+        try:
+            # New API (PyTorch 2.4+)
+            return torch.amp.autocast(device_type=device_type, dtype=dtype)
+        except TypeError:
+            # Old API
+            return torch.cuda.amp.autocast(dtype=dtype)
+    # No-op context manager
+    from contextlib import nullcontext
+    return nullcontext()
 
 
 def freeze_layers(model: nn.Module, config: PretrainedFinetuneConfig):
@@ -398,7 +416,7 @@ def finetune_pretrained(config: PretrainedFinetuneConfig):
             labels = batch["labels"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             
-            with autocast(device_type=device.type, dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
+            with get_amp_context(device.type, amp_dtype, amp_dtype != torch.float32):
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
