@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.model.model import SmallLM, ModelConfig, strip_wrapper_prefixes
 from src.tokenizer.tokenizer import ChatTokenizer
 from src.data.dataset import create_dataloaders, DataConfig
-from src.training.checkpoint_io import save_checkpoint_files
+from src.training.checkpoint_io import save_checkpoint_files, write_config_yaml
 from src.training.distributed import (
     cleanup_distributed, init_distributed, is_main_process,
     reduce_loss_totals, unwrap_model,
@@ -148,12 +148,12 @@ def save_checkpoint(
         checkpoint, path, step, best=best_payload, best_path=best_path
     )
 
-    # model.pt + config.yaml are the plain-load artifacts; a failed write here
-    # must not kill a run whose training checkpoint is already on disk.
+    # config.yaml is the plain-load sidecar; model.pt would duplicate
+    # best_model.pt and cost another 445 MB, so it is not written.
     try:
-        model.save_pretrained(path)
+        write_config_yaml(model, path)
     except (OSError, RuntimeError) as exc:
-        print(f"[checkpoint] model.pt write failed: {exc}")
+        print(f"[checkpoint] config.yaml write failed: {exc}")
 
     if wrote:
         print(f"Checkpoint saved: step {step}")

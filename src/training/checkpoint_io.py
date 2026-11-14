@@ -13,8 +13,9 @@ from typing import Any, Optional
 import torch
 
 # Stepped checkpoints kept on disk. `latest.pt` and `best_model.pt` are separate
-# and always kept, so this only bounds the rolling history.
-KEEP_STEP_CHECKPOINTS = 2
+# and always kept, so this only bounds the rolling history. One history file is
+# enough for a resume; a 16 GB container volume cannot hold more.
+KEEP_STEP_CHECKPOINTS = 1
 
 # Headroom over the serialized size so a rename-based write never runs the volume
 # to zero mid-save.
@@ -135,6 +136,19 @@ def _link_or_copy(src: str, dst: str, payload: Any) -> bool:
         except OSError:
             pass
         return atomic_save(payload, dst)
+
+
+def write_config_yaml(model, path: str) -> None:
+    """Write the architecture sidecar next to the checkpoints.
+
+    `model.pt` is deliberately not written: it duplicates `best_model.pt` byte
+    for byte and costs another 445 MB on a volume that may not have it.
+    """
+    import yaml
+
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "config.yaml"), "w") as handle:
+        yaml.dump(model.config.__dict__, handle)
 
 
 def save_checkpoint_files(

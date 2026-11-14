@@ -4,6 +4,7 @@ Components: pre-norm, weight-tied embeddings, RoPE, RMSNorm, SwiGLU MLP.
 Optimized: fused RoPE, flash attention, fused SwiGLU, compile-friendly.
 """
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
@@ -31,6 +32,14 @@ class ModelConfig:
     # Performance
     use_flash_attn: bool = True
     fused_swiglu: bool = True
+
+
+def _step_number(file_path: str) -> int:
+    """Numeric step index for a step_*.pt path (step_10000 follows step_5000)."""
+    import re
+
+    match = re.search(r"step_(\d+)\.pt$", os.path.basename(file_path))
+    return int(match.group(1)) if match else -1
 
 
 def strip_wrapper_prefixes(state_dict: dict) -> dict:
@@ -513,7 +522,6 @@ class SmallLM(nn.Module):
     
     @classmethod
     def from_pretrained(cls, path: str, device: str = "cpu") -> "SmallLM":
-        import re
         import yaml, os, glob
 
         def resolve_model_config(raw) -> dict:
@@ -557,8 +565,24 @@ class SmallLM(nn.Module):
                     )
                 elif os.path.exists(model_pt_path):
                     state_dict = torch.load(model_pt_path, map_location="cpu")
+                elif os.path.exists(latest_path):
+                    # No best model yet: fall back to the latest training checkpoint.
+                    checkpoint = torch.load(latest_path, map_location="cpu")
+                    config_dict = resolve_model_config(
+                        checkpoint.get("config", checkpoint.get("model_config"))
+                    )
+                    state_dict = checkpoint["model"]
                 else:
-                    raise FileNotFoundError(f"No model weights found in {path}")
+                    step_files = sorted(
+                        glob.glob(os.path.join(path, "step_*.pt")), key=_step_number
+                    )
+                    if not step_files:
+                        raise FileNotFoundError(f"No model weights found in {path}")
+                    checkpoint = torch.load(step_files[-1], map_location="cpu")
+                    config_dict = resolve_model_config(
+                        checkpoint.get("config", checkpoint.get("model_config"))
+                    )
+                    state_dict = checkpoint["model"]
             elif os.path.exists(latest_path):
                 # Training checkpoints (latest.pt) contain config in the dict
                 checkpoint = torch.load(latest_path, map_location="cpu")
@@ -568,11 +592,9 @@ class SmallLM(nn.Module):
                 state_dict = checkpoint["model"]
             else:
                 # Fall back to latest step_*.pt (numeric sort: step_10000 follows step_5000)
-                def step_number(file_path: str) -> int:
-                    match = re.search(r"step_(\d+)\.pt$", os.path.basename(file_path))
-                    return int(match.group(1)) if match else -1
-
-                step_files = sorted(glob.glob(os.path.join(path, "step_*.pt")), key=step_number)
+                step_files = sorted(
+                    glob.glob(os.path.join(path, "step_*.pt")), key=_step_number
+                )
                 if step_files:
                     latest_step = step_files[-1]
                     checkpoint = torch.load(latest_step, map_location="cpu")

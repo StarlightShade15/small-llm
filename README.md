@@ -339,19 +339,23 @@ iostream error` from `torch.save` is the disk hitting that wall mid-write.
 
 Checkpoints are now written through a temp file and renamed into place, so a
 failed write leaves the previous `latest.pt` intact instead of a torn file. Only
-the two newest `step_*.pt` files are kept, `latest.pt` is hard-linked to the
-current step file instead of duplicating 1.4 GB, `best_model.pt` is written
-before the heavier files, and a save is skipped with a clear message when the
-volume cannot hold it.
+the newest `step_*.pt` file is kept, `latest.pt` is hard-linked to the current
+step file instead of duplicating 1.4 GB, `model.pt` is no longer written (it
+duplicated `best_model.pt` for another 445 MB), `best_model.pt` is written before
+the heavier files, and a save is skipped with a clear message when the volume
+cannot hold it.
 
 ```bash
 df -h /workspace                       # free space on the volume
 du -sh checkpoints/*                   # what the checkpoints are costing
+pip cache purge                        # pip wheels are usually the biggest stray
+rm -rf /root/.cache/pip /root/.cache/huggingface
 rm -f checkpoints/finetune/step_200.pt # delete a torn write
 ```
 
-Resume from the surviving `latest.pt` — the run picks up the optimizer step it
-was written at.
+Steady state after the fix is ~1.9 GB for a checkpoint directory: one 1.4 GB
+`step_*.pt`, a hard-linked `latest.pt`, and a 445 MB `best_model.pt`. Resume from
+the surviving `latest.pt` — the run picks up the optimizer step it was written at.
 
 ### Resume Training Fails
 ```bash
