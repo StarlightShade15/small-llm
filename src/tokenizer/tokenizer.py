@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 from typing import List, Dict, Optional, Union
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, processors
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 from tokenizers.normalizers import NFKC, Sequence
 import yaml
 
@@ -37,13 +37,6 @@ def build_tokenizer(vocab_size: int = 16384) -> Tokenizer:
     
     # Decoder: byte-level
     tokenizer.decoder = decoders.ByteLevel()
-    
-    # Post-processor: add special tokens for chat template
-    tokenizer.post_processor = processors.TemplateProcessing(
-        single=f"{SPECIAL_TOKENS[1]} $A {SPECIAL_TOKENS[2]} $B {SPECIAL_TOKENS[3]}",
-        pair=None,
-        special_tokens=[(t, SPECIAL_TOKEN_MAP[t]) for t in SPECIAL_TOKENS],
-    )
     
     # Trainer
     trainer = trainers.BpeTrainer(
